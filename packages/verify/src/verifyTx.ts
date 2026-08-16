@@ -9,7 +9,7 @@ import {
 } from '@solana/kit';
 import { DisdkError } from '@disdk/protocol';
 import type { BuiltTransaction } from './build.js';
-import type { SolanaRpc } from './rpc.js';
+import { withRpc, type SolanaRpc } from './rpc.js';
 
 export interface VerifiedTransaction {
   transaction: Transaction;
@@ -75,13 +75,15 @@ export async function verifyOnChainPermit(
   signature: string,
   expected: BuiltTransaction,
 ): Promise<void> {
-  const result = await rpc
-    .getTransaction(signature as Parameters<SolanaRpc['getTransaction']>[0], {
-      commitment: 'confirmed',
-      encoding: 'base64',
-      maxSupportedTransactionVersion: 0,
-    })
-    .send();
+  const result = await withRpc('confirming the transaction', () =>
+    rpc
+      .getTransaction(signature as Parameters<SolanaRpc['getTransaction']>[0], {
+        commitment: 'confirmed',
+        encoding: 'base64',
+        maxSupportedTransactionVersion: 0,
+      })
+      .send(),
+  );
 
   if (!result) {
     throw new DisdkError(

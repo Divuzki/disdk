@@ -14,3 +14,6 @@ sponsor-keypair.json
 *.log
 .vite/
 .turbo/
+
+# Built SDK bundle, copied into the demo by `pnpm sync-sdk`
+apps/demo/public/disdk.global.js

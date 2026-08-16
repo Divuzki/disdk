@@ -28,7 +28,7 @@ import {
   type SessionRecord,
 } from '@disdk/verify';
 import { address } from '@solana/kit';
-import type { Services } from './services.js';
+import type { Services } from './services.ts';
 
 export function createApi(services: Services): Hono {
   const app = new Hono();

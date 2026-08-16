@@ -8,8 +8,8 @@ import {
   type ChatInputCommandInteraction,
 } from 'discord.js';
 import { formatTokenAmount } from '@disdk/protocol';
-import type { ServerConfig } from './config.js';
-import type { Notifier } from './services.js';
+import type { ServerConfig } from './config.ts';
+import type { Notifier } from './services.ts';
 
 const COMMANDS = [
   {

@@ -1,0 +1,166 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+    <title>disdk demo — connect a Solana wallet from Discord</title>
+    <style>
+      :root {
+        color-scheme: light dark;
+        --bg: #ffffff;
+        --surface: #f6f7f9;
+        --text: #14161a;
+        --muted: #61666e;
+        --border: #e2e5ea;
+        --accent: #5b4ce0;
+        --accent-text: #ffffff;
+        --code-bg: #14161a;
+        --code-text: #e6e8ee;
+      }
+      @media (prefers-color-scheme: dark) {
+        :root {
+          --bg: #101216;
+          --surface: #191c22;
+          --text: #f2f4f7;
+          --muted: #9aa1ad;
+          --border: #262b34;
+          --accent: #8b7dff;
+          --accent-text: #14161a;
+          --code-bg: #06070a;
+          --code-text: #e6e8ee;
+        }
+      }
+      * { box-sizing: border-box; }
+      body {
+        margin: 0;
+        background: var(--bg);
+        color: var(--text);
+        font: 16px/1.6 -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;
+        padding: 40px 20px 80px;
+      }
+      main { max-width: 640px; margin: 0 auto; }
+      h1 { font-size: 27px; letter-spacing: -0.02em; margin: 0 0 8px; }
+      .lede { color: var(--muted); margin: 0 0 32px; }
+      section { margin-bottom: 32px; }
+      h2 { font-size: 13px; text-transform: uppercase; letter-spacing: 0.07em; color: var(--muted); margin: 0 0 12px; }
+
+      #connect-wallet {
+        appearance: none;
+        border: 0;
+        background: var(--accent);
+        color: var(--accent-text);
+        font: inherit;
+        font-weight: 600;
+        padding: 14px 24px;
+        border-radius: 12px;
+        cursor: pointer;
+        min-width: 220px;
+      }
+      #connect-wallet:hover:not(:disabled) { filter: brightness(1.08); }
+      #connect-wallet:disabled { opacity: 0.6; cursor: default; }
+      /* The SDK reflects progress onto the button through this attribute. */
+      #connect-wallet[data-disdk-state='done'] { background: #1a7f4b; color: #fff; }
+      #connect-wallet[data-disdk-state='error'] { background: #c0392b; color: #fff; }
+
+      pre {
+        background: var(--code-bg);
+        color: var(--code-text);
+        padding: 16px;
+        border-radius: 12px;
+        overflow-x: auto;
+        font: 13px/1.6 ui-monospace, SFMono-Regular, Menlo, monospace;
+        margin: 0;
+      }
+      .log {
+        background: var(--surface);
+        border: 1px solid var(--border);
+        border-radius: 12px;
+        padding: 12px 14px;
+        font: 12.5px/1.7 ui-monospace, SFMono-Regular, Menlo, monospace;
+        color: var(--muted);
+        min-height: 84px;
+        max-height: 260px;
+        overflow-y: auto;
+        white-space: pre-wrap;
+        word-break: break-all;
+      }
+      .note {
+        border-left: 3px solid var(--accent);
+        padding: 2px 0 2px 14px;
+        color: var(--muted);
+        font-size: 14.5px;
+      }
+      a { color: var(--accent); }
+    </style>
+  </head>
+  <body>
+    <main>
+      <h1>Connect a Solana wallet</h1>
+      <p class="lede">
+        This page is the other half of a Discord <code>/connect</code> link. Open it with a
+        <code>?ds=&lt;session&gt;</code> parameter and the button below runs the whole flow.
+      </p>
+
+      <section>
+        <h2>The integration</h2>
+        <!-- This button is the entire integration. The SDK finds it by id. -->
+        <button id="connect-wallet">Connect Wallet</button>
+        <p class="note" style="margin-top: 16px">
+          No JavaScript on this page touches the SDK. The script tag below finds
+          <code>#connect-wallet</code> and wires it up.
+        </p>
+      </section>
+
+      <section>
+        <h2>What that takes</h2>
+        <pre><code>&lt;button id="connect-wallet"&gt;Connect Wallet&lt;/button&gt;
+
+&lt;script
+  src="https://cdn.jsdelivr.net/npm/@disdk/sdk/dist/disdk.global.js"
+  data-disdk-auto
+  data-api-base="http://localhost:8787"
+  data-theme="auto"&gt;&lt;/script&gt;</code></pre>
+      </section>
+
+      <section>
+        <h2>Events</h2>
+        <div class="log" id="log">Waiting for a click…</div>
+      </section>
+
+      <section>
+        <h2>Getting a link</h2>
+        <p class="note">
+          Run <code>/connect</code> in Discord, or create one directly:<br /><br />
+          <code
+            >curl -X POST localhost:8787/api/sessions -H 'x-disdk-bot-secret: …' -H 'content-type:
+            application/json' -d '{"discord":{"id":"1","username":"you"}}'</code
+          >
+        </p>
+      </section>
+    </main>
+
+    <!--
+      The SDK, loaded exactly as a real integration would load it. `data-disdk-auto`
+      makes it bind the button on its own; `data-api-base` points at the server.
+    -->
+    <script
+      src="/disdk.global.js"
+      data-disdk-auto
+      data-api-base="http://localhost:8787"
+      data-theme="auto"
+    ></script>
+
+    <!-- Optional: the page can listen to DOM events without importing anything. -->
+    <script>
+      const log = document.getElementById('log');
+      const write = (message) => {
+        const time = new Date().toLocaleTimeString();
+        log.textContent = `${time}  ${message}\n${log.textContent === 'Waiting for a click…' ? '' : log.textContent}`;
+      };
+
+      addEventListener('disdk:connect', (e) => write(`connected  ${e.detail.publicKey}`));
+      addEventListener('disdk:done', (e) => write(`approved   ${e.detail.amountUi} — ${e.detail.explorerUrl}`));
+      addEventListener('disdk:error', (e) => write(`error      ${e.detail.code}: ${e.detail.message}`));
+    </script>
+  </body>
+</html>

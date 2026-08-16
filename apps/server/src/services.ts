@@ -5,8 +5,8 @@ import {
   type SolanaRpc,
 } from '@disdk/verify';
 import type { PermitConfig } from '@disdk/verify';
-import { RateLimiter } from './ratelimit.js';
-import type { ServerConfig } from './config.js';
+import { RateLimiter } from './ratelimit.ts';
+import type { ServerConfig } from './config.ts';
 
 export interface Notifier {
   /** Tell Discord the link succeeded. Best-effort; failures must not break the flow. */

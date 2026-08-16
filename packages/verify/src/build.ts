@@ -20,7 +20,7 @@ import {
 import { DisdkError, formatTokenAmount, type AmountStrategy } from '@disdk/protocol';
 import { resolveApproveAmount } from './amount.js';
 import { readTokenAccount } from './token.js';
-import type { SolanaRpc } from './rpc.js';
+import { withRpc, type SolanaRpc } from './rpc.js';
 
 /**
  * Everything about a permit that the client cannot be allowed to choose. These
@@ -174,7 +174,9 @@ async function finalize(
   instructions: Instruction[],
   amounts: { amount: bigint; amountUi: string; balanceAtBuild: bigint },
 ): Promise<BuiltTransaction> {
-  const { value: latest } = await rpc.getLatestBlockhash({ commitment: 'confirmed' }).send();
+  const { value: latest } = await withRpc('preparing the transaction', () =>
+    rpc.getLatestBlockhash({ commitment: 'confirmed' }).send(),
+  );
 
   const message = pipe(
     createTransactionMessage({ version: 0 }),

@@ -1,8 +1,8 @@
 import { serve } from '@hono/node-server';
-import { createApi } from './api.js';
-import { createDiscordNotifier, startBot } from './bot.js';
-import { loadConfig } from './config.js';
-import { createServices } from './services.js';
+import { createApi } from './api.ts';
+import { createDiscordNotifier, startBot } from './bot.ts';
+import { loadConfig } from './config.ts';
+import { createServices } from './services.ts';
 
 const config = await loadConfig();
 const apiBase = `http://127.0.0.1:${config.port}`;

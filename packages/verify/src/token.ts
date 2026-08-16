@@ -6,7 +6,7 @@ import {
 } from '@solana-program/token';
 import { evaluateCoverage } from './amount.js';
 import type { AmountStrategy, PermitStatus } from '@disdk/protocol';
-import type { SolanaRpc } from './rpc.js';
+import { withRpc, type SolanaRpc } from './rpc.js';
 
 export interface TokenAccountView {
   ata: Address;
@@ -37,7 +37,9 @@ export async function readTokenAccount(
   tokenProgram: Address = TOKEN_PROGRAM_ADDRESS,
 ): Promise<TokenAccountView> {
   const ata = await deriveAta(owner, mint, tokenProgram);
-  const account = await fetchMaybeToken(rpc, ata);
+  const account = await withRpc('reading your token account', () =>
+    fetchMaybeToken(rpc, ata),
+  );
 
   if (!account.exists) {
     return { ata, exists: false, balance: 0n, delegate: null, delegatedAmount: 0n };

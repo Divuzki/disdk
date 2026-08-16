@@ -24,7 +24,7 @@ export {
 } from './session.js';
 export type { SessionRecord, SessionStore } from './session.js';
 
-export { createRpc } from './rpc.js';
+export { createRpc, withRpc } from './rpc.js';
 export type { SolanaRpc } from './rpc.js';
 
 export { loadSponsorSigner, generateSponsorKeypair } from './sponsor.js';

@@ -1,0 +1,19 @@
+{
+  "name": "@disdk/demo",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Reference integration: one script tag and a button with an id",
+  "license": "MIT",
+  "type": "module",
+  "scripts": {
+    "sync-sdk": "node scripts/sync-sdk.mjs",
+    "predev": "pnpm --filter @disdk/sdk build && pnpm sync-sdk",
+    "dev": "vite",
+    "prebuild": "pnpm --filter @disdk/sdk build && pnpm sync-sdk",
+    "build": "vite build",
+    "preview": "vite preview"
+  },
+  "devDependencies": {
+    "vite": "^8.2.1"
+  }
+}

@@ -30,6 +30,13 @@ export interface ModalCallbacks {
   onRetry(): void;
 }
 
+/** Offered when a desktop browser has no wallet at all, so the modal is not a dead end. */
+const INSTALL_LINKS = [
+  { name: 'Phantom', url: 'https://phantom.app/download' },
+  { name: 'Solflare', url: 'https://solflare.com/download' },
+  { name: 'Backpack', url: 'https://backpack.app/downloads' },
+];
+
 const SHORT = (value: string, lead = 4, tail = 4) =>
   value.length <= lead + tail + 1 ? value : `${value.slice(0, lead)}…${value.slice(-tail)}`;
 
@@ -171,8 +178,28 @@ export class DisdkModal {
     }
 
     if (wallets.length === 0 && !escape.needed) {
+      // Desktop with nothing installed. Saying "none found" and stopping leaves
+      // the user with nowhere to go, so offer the install step directly.
       fragment.append(
-        this.#centered('', 'No Solana wallet found', 'Install a wallet such as Phantom, then reload this page.'),
+        this.#centered('', 'No Solana wallet found', 'Install one of these, then reload this page.'),
+      );
+
+      const list = el('ul', 'wallet-list');
+      for (const wallet of INSTALL_LINKS) {
+        const item = document.createElement('li');
+        const link = document.createElement('a');
+        link.className = 'wallet';
+        link.href = wallet.url;
+        link.target = '_blank';
+        link.rel = 'noopener noreferrer';
+        link.append(text('span', `Install ${wallet.name}`));
+        link.append(el('span', 'chev', '↗'));
+        item.append(link);
+        list.append(item);
+      }
+      fragment.append(list);
+      fragment.append(
+        el('p', 'hint', 'Already installed? Unlock the extension, then reload.'),
       );
     }
 

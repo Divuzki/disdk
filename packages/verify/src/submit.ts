@@ -1,7 +1,7 @@
 import type { Signature } from '@solana/kit';
 import { DisdkError } from '@disdk/protocol';
 import type { BuiltTransaction } from './build.js';
-import type { SolanaRpc } from './rpc.js';
+import { withRpc, type SolanaRpc } from './rpc.js';
 
 export interface ConfirmOptions {
   /** How long to wait for confirmation before giving up. */
@@ -50,9 +50,11 @@ export async function confirmSignature(
   const deadline = Date.now() + timeoutMs;
 
   while (Date.now() < deadline) {
-    const { value } = await rpc
-      .getSignatureStatuses([signature as Signature], { searchTransactionHistory: false })
-      .send();
+    const { value } = await withRpc('checking the transaction status', () =>
+      rpc
+        .getSignatureStatuses([signature as Signature], { searchTransactionHistory: false })
+        .send(),
+    );
     const status = value[0];
 
     if (status) {
@@ -69,7 +71,9 @@ export async function confirmSignature(
 
     // If the chain has moved past the blockhash's validity window and the
     // transaction still has not landed, it never will.
-    const blockHeight = await rpc.getBlockHeight({ commitment: 'confirmed' }).send();
+    const blockHeight = await withRpc('checking the block height', () =>
+      rpc.getBlockHeight({ commitment: 'confirmed' }).send(),
+    );
     if (blockHeight > expected.lastValidBlockHeight) {
       throw new DisdkError(
         'TRANSACTION_EXPIRED',
