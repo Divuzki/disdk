@@ -5,6 +5,17 @@ import type { BuiltTransaction } from './build.js';
 export interface SessionRecord {
   /** SHA-256 of the session id. The raw id is never stored. */
   idHash: string;
+  /**
+   * Random per-session marker written into the transaction as a memo.
+   *
+   * Without it, two sessions requesting the same allowance from the same wallet
+   * within one blockhash window compile to byte-identical transactions — so an
+   * approval made in one session would satisfy another, and since signatures
+   * are public on chain anyone could replay someone else's approval to bind
+   * that wallet to their own Discord account. This is distinct from the session
+   * id: it ends up on chain, so it must not be a bearer token.
+   */
+  nonce: string;
   state: SessionState;
   intent: SessionIntent;
   discord: DiscordIdentity;
@@ -75,6 +86,7 @@ export class MemorySessionStore implements SessionStore {
 
     const record: SessionRecord = {
       idHash,
+      nonce: randomBytes(12).toString('hex'),
       state: 'pending',
       intent,
       discord,

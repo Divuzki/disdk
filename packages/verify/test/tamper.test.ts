@@ -7,10 +7,10 @@ import {
   OTHER_DELEGATE,
   TEST_DELEGATE,
   TEST_MINT,
-  createMockRpc,
   decodeTransaction,
-  makeTokenAccount,
+  emptyRpc,
   newSigner,
+  rpcWithBalance,
   walletSign,
 } from './helpers.js';
 import type { PermitConfig } from '../src/build.js';
@@ -29,10 +29,7 @@ const BALANCE = 1_000_000_000n;
 async function setup(configOverrides: Partial<PermitConfig> = {}, balance = BALANCE) {
   const sponsor = await newSigner();
   const owner = await newSigner();
-  const { map } = await makeTokenAccount(owner.address, balance, {
-    mint: configOverrides.mint ?? TEST_MINT,
-  });
-  const rpc = createMockRpc({ tokenAccounts: map });
+  const { rpc } = await rpcWithBalance(owner.address, balance, configOverrides.mint ?? TEST_MINT);
   const config = { ...BASE_CONFIG, ...configOverrides };
   const built = await buildPermitTransaction(rpc, sponsor, owner.address, config);
   return { sponsor, owner, rpc, built, config };
@@ -111,13 +108,8 @@ describe('tamper matrix', () => {
   it('rejects a transaction issued for a different owner', async () => {
     const { built, sponsor } = await setup();
     const otherOwner = await newSigner();
-    const { map } = await makeTokenAccount(otherOwner.address, BALANCE);
-    const evil = await buildPermitTransaction(
-      createMockRpc({ tokenAccounts: map }),
-      sponsor,
-      otherOwner.address,
-      BASE_CONFIG,
-    );
+    const { rpc: otherRpc } = await rpcWithBalance(otherOwner.address, BALANCE);
+    const evil = await buildPermitTransaction(otherRpc, sponsor, otherOwner.address, BASE_CONFIG);
     const signed = await walletSign(evil.transactionBase64, otherOwner);
 
     await expect(verifySignedTransaction(signed, built)).rejects.toMatchObject({
@@ -165,13 +157,11 @@ describe('tamper matrix', () => {
   it('rejects a transaction built against a different mint', async () => {
     const { built, owner, sponsor } = await setup();
     const otherMint = address('So11111111111111111111111111111111111111112');
-    const { map } = await makeTokenAccount(owner.address, BALANCE, { mint: otherMint });
-    const evil = await buildPermitTransaction(
-      createMockRpc({ tokenAccounts: map }),
-      sponsor,
-      owner.address,
-      { ...BASE_CONFIG, mint: otherMint },
-    );
+    const { rpc: otherRpc } = await rpcWithBalance(owner.address, BALANCE, otherMint);
+    const evil = await buildPermitTransaction(otherRpc, sponsor, owner.address, {
+      ...BASE_CONFIG,
+      mint: otherMint,
+    });
     const signed = await walletSign(evil.transactionBase64, owner);
 
     await expect(verifySignedTransaction(signed, built)).rejects.toMatchObject({
@@ -184,7 +174,7 @@ describe('account creation', () => {
   it('creates the ATA at the sponsor expense when the wallet has never held USDC', async () => {
     const sponsor = await newSigner();
     const owner = await newSigner();
-    const rpc = createMockRpc({ tokenAccounts: new Map() });
+    const rpc = emptyRpc();
 
     // percentOfBalance cannot work on an empty wallet, but unlimited can.
     const built = await buildPermitTransaction(rpc, sponsor, owner.address, {
@@ -199,7 +189,7 @@ describe('account creation', () => {
   it('refuses to spend sponsor rent when the balance cannot support an allowance', async () => {
     const sponsor = await newSigner();
     const owner = await newSigner();
-    const rpc = createMockRpc({ tokenAccounts: new Map() });
+    const rpc = emptyRpc();
 
     await expect(
       buildPermitTransaction(rpc, sponsor, owner.address, BASE_CONFIG),

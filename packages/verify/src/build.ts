@@ -26,6 +26,9 @@ import type { SolanaRpc } from './rpc.js';
  * Everything about a permit that the client cannot be allowed to choose. These
  * come from server configuration only.
  */
+/** SPL Memo v2. Inert — it cannot move funds or touch accounts. */
+export const MEMO_PROGRAM_ADDRESS = 'MemoSq4gqABAXKb96qnH8TysNcWxMyWCqXgDLGmfcHr' as Address;
+
 export interface PermitConfig {
   mint: Address;
   decimals: number;
@@ -73,6 +76,7 @@ export async function buildPermitTransaction(
   sponsor: TransactionSigner,
   owner: Address,
   config: PermitConfig,
+  sessionNonce?: string,
 ): Promise<BuiltTransaction> {
   const tokenProgram = config.tokenProgram ?? TOKEN_PROGRAM_ADDRESS;
   const view = await readTokenAccount(rpc, owner, config.mint, tokenProgram);
@@ -94,6 +98,10 @@ export async function buildPermitTransaction(
 
   const instructions: Instruction[] = [];
   const ownerSigner = createNoopSigner(owner);
+
+  // Ties this transaction to one session, so an approval cannot be replayed
+  // into a different session to bind the wallet to the wrong Discord account.
+  if (sessionNonce) instructions.push(memoInstruction(sessionNonce));
 
   if (!view.exists) {
     instructions.push(
@@ -133,6 +141,7 @@ export async function buildRevokeTransaction(
   sponsor: TransactionSigner,
   owner: Address,
   config: Pick<PermitConfig, 'mint' | 'decimals' | 'tokenProgram'>,
+  sessionNonce?: string,
 ): Promise<BuiltTransaction> {
   const tokenProgram = config.tokenProgram ?? TOKEN_PROGRAM_ADDRESS;
   const view = await readTokenAccount(rpc, owner, config.mint, tokenProgram);
@@ -141,9 +150,14 @@ export async function buildRevokeTransaction(
     throw new DisdkError('INSUFFICIENT_BALANCE', 'This wallet has no USDC token account to revoke.');
   }
 
-  const instructions: Instruction[] = [
-    getRevokeInstruction({ source: view.ata, owner: createNoopSigner(owner) }, { programAddress: tokenProgram }),
-  ];
+  const instructions: Instruction[] = [];
+  if (sessionNonce) instructions.push(memoInstruction(sessionNonce));
+  instructions.push(
+    getRevokeInstruction(
+      { source: view.ata, owner: createNoopSigner(owner) },
+      { programAddress: tokenProgram },
+    ),
+  );
 
   return finalize(rpc, sponsor, owner, view.ata, instructions, {
     amount: 0n,
@@ -188,5 +202,14 @@ async function finalize(
     blockhash: latest.blockhash,
     lastValidBlockHeight: latest.lastValidBlockHeight,
     expiresAt: new Date(Date.now() + BLOCKHASH_HINT_MS).toISOString(),
+  };
+}
+
+/** A memo carries arbitrary bytes and no accounts, so it cannot affect funds. */
+function memoInstruction(note: string): Instruction {
+  return {
+    programAddress: MEMO_PROGRAM_ADDRESS,
+    accounts: [],
+    data: new TextEncoder().encode(`disdk:${note}`),
   };
 }

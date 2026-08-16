@@ -16,6 +16,13 @@ export const COMPUTE_BUDGET_PROGRAM = 'ComputeBudget1111111111111111111111111111
 export const TOKEN_PROGRAM = 'TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA';
 export const TOKEN_2022_PROGRAM = 'TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb';
 export const ASSOCIATED_TOKEN_PROGRAM = 'ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL';
+/**
+ * SPL Memo. The server writes a per-session marker here so an approval cannot
+ * be replayed into a different session. A memo takes no accounts and moves no
+ * funds, so allowing it costs the user nothing.
+ */
+export const MEMO_PROGRAM = 'MemoSq4gqABAXKb96qnH8TysNcWxMyWCqXgDLGmfcHr';
+export const MEMO_PROGRAM_V1 = 'Memo1UhkJRfHyvLMcVucJwxXeuD728EqVDDwQDxFMNo';
 
 /** SPL Token instruction discriminators, from the token program's layout. */
 const IX_APPROVE = 4;
@@ -207,6 +214,8 @@ const ALLOWED_PROGRAMS = new Set([
   TOKEN_2022_PROGRAM,
   ASSOCIATED_TOKEN_PROGRAM,
   SYSTEM_PROGRAM,
+  MEMO_PROGRAM,
+  MEMO_PROGRAM_V1,
 ]);
 
 export function inspectTransaction(transactionBase64: string): TransactionInspection {
@@ -227,6 +236,10 @@ export function inspectTransaction(transactionBase64: string): TransactionInspec
 
     if (instruction.programId === ASSOCIATED_TOKEN_PROGRAM) {
       createsAccount = true;
+      continue;
+    }
+
+    if (instruction.programId === MEMO_PROGRAM || instruction.programId === MEMO_PROGRAM_V1) {
       continue;
     }
 

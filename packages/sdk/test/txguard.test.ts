@@ -126,6 +126,21 @@ describe('decoding a real sponsored permit', () => {
     expect(decoded.feePayer).not.toBe(owner.address);
   });
 
+  it('accepts the session-binding memo', async () => {
+    const { sponsor, owner, expectation } = await setup();
+    // The server writes a per-session marker so an approval cannot be replayed
+    // into someone else's session. It holds no accounts, so it is harmless.
+    const memo: Instruction = {
+      programAddress: address('MemoSq4gqABAXKb96qnH8TysNcWxMyWCqXgDLGmfcHr'),
+      accounts: [],
+      data: new TextEncoder().encode('disdk:9f2c1ab4de77'),
+    };
+    const tx = await buildTx([memo, approveIx(owner.address)], sponsor);
+
+    const result = verifyPermitTransaction(tx, expectation);
+    expect(result.amount).toBe(AMOUNT);
+  });
+
   it('accepts an accompanying token-account creation', async () => {
     const { sponsor, owner, expectation } = await setup();
     // Mirrors what the server emits for a wallet that has never held USDC.

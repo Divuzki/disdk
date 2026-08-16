@@ -28,6 +28,7 @@ export {
   TOKEN_2022_PROGRAM,
   ASSOCIATED_TOKEN_PROGRAM,
   COMPUTE_BUDGET_PROGRAM,
+  MEMO_PROGRAM,
 } from './txguard.js';
 export type {
   ApproveDetails,
