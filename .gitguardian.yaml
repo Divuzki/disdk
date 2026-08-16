@@ -1,0 +1,23 @@
+version: 2
+
+secret:
+  ignored-matches:
+    # Solana program IDs are public, well-known account addresses that every
+    # client hardcodes — they are base58 public keys, not credentials. Generic
+    # high-entropy detection flags them because base58 looks like a token.
+    #
+    # Real secrets in this project (the sponsor keypair, the Discord bot token,
+    # the bot API secret) are read from the environment and are listed only in
+    # apps/server/.env.example with empty values.
+    - name: SPL Token-2022 program ID (public constant)
+      match: TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb
+    - name: Associated Token Account program ID (public constant)
+      match: ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL
+    - name: SPL Token program ID (public constant)
+      match: TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA
+    - name: SPL Memo program ID (public constant)
+      match: MemoSq4gqABAXKb96qnH8TysNcWxMyWCqXgDLGmfcHr
+    - name: Mainnet USDC mint (public constant)
+      match: EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v
+    - name: Devnet USDC mint (public constant)
+      match: 4zMMC9srt5Ri5X14GAgXhaHii3GnPAEERYPJgZJDncDU
