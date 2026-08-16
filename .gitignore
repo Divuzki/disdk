@@ -1,0 +1,19 @@
+node_modules/
+dist/
+coverage/
+*.tsbuildinfo
+
+# Secrets — the sponsor keypair and bot token must never be committed
+.env
+.env.*
+!.env.example
+*.keypair.json
+sponsor-keypair.json
+
+.DS_Store
+*.log
+.vite/
+.turbo/
+
+# Built SDK bundle, copied into the demo by `pnpm sync-sdk`
+apps/demo/public/disdk.global.js

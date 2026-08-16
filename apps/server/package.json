@@ -1,0 +1,28 @@
+{
+  "name": "@disdk/server",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Reference disdk server: session API, sponsored permit issuance, and the Discord bot",
+  "license": "MIT",
+  "type": "module",
+  "scripts": {
+    "dev": "node --watch --experimental-strip-types src/main.ts",
+    "start": "node --experimental-strip-types src/main.ts",
+    "keygen": "node --experimental-strip-types scripts/keygen.ts",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "@disdk/protocol": "workspace:*",
+    "@disdk/verify": "workspace:*",
+    "@hono/node-server": "^1.14.0",
+    "@solana/kit": "^7.1.0",
+    "discord.js": "^14.27.0",
+    "hono": "^4.13.2"
+  },
+  "devDependencies": {
+    "@types/node": "^26.2.0",
+    "typescript": "^5.9.3",
+    "vitest": "^4.1.10"
+  }
+}
