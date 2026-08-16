@@ -1,0 +1,43 @@
+{
+  "name": "@disdk/sdk",
+  "version": "0.1.0",
+  "description": "Drop-in browser SDK: connect a Solana wallet from a Discord link and grant a sponsored USDC allowance",
+  "license": "MIT",
+  "type": "module",
+  "main": "./dist/index.cjs",
+  "module": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "unpkg": "./dist/disdk.global.js",
+  "jsdelivr": "./dist/disdk.global.js",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js",
+      "require": "./dist/index.cjs"
+    }
+  },
+  "files": ["dist"],
+  "sideEffects": ["./dist/disdk.global.js"],
+  "keywords": ["solana", "wallet", "discord", "usdc", "wallet-standard", "sdk"],
+  "scripts": {
+    "build": "tsup",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "@disdk/protocol": "workspace:*",
+    "@solana/wallet-standard-chains": "^1.1.2",
+    "@solana/wallet-standard-features": "^1.4.0",
+    "@wallet-standard/app": "^1.1.1",
+    "@wallet-standard/base": "^1.1.1"
+  },
+  "optionalDependencies": {
+    "@solana-mobile/wallet-standard-mobile": "^0.5.3"
+  },
+  "devDependencies": {
+    "jsdom": "^25.0.1",
+    "tsup": "^8.5.1",
+    "typescript": "^5.9.3",
+    "vitest": "^4.1.10"
+  }
+}

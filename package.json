@@ -1,0 +1,22 @@
+{
+  "name": "disdk-monorepo",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Discord to Solana wallet connect + sponsored USDC permit SDK",
+  "license": "MIT",
+  "engines": {
+    "node": ">=20"
+  },
+  "packageManager": "pnpm@10.33.0",
+  "scripts": {
+    "build": "pnpm -r --filter \"./packages/**\" build",
+    "typecheck": "pnpm -r typecheck",
+    "test": "pnpm -r test",
+    "dev": "pnpm --parallel --filter \"./apps/**\" dev",
+    "clean": "pnpm -r exec rm -rf dist node_modules/.cache"
+  },
+  "devDependencies": {
+    "typescript": "^5.9.3",
+    "vitest": "^4.1.10"
+  }
+}
