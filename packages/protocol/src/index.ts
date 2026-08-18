@@ -53,7 +53,48 @@ export type SessionState =
   | 'expired'
   | 'failed';
 
-export type SessionIntent = 'permit' | 'reapprove' | 'revoke';
+/**
+ * What a session is for.
+ *
+ * `permit`, `reapprove` and `revoke` all concern a *delegate allowance* — a
+ * revocable permission recorded on the token account, which moves nothing by
+ * itself. `sweep` is categorically different: it transfers funds immediately
+ * and irreversibly. It is restricted to a server-side operator allowlist and is
+ * disabled entirely unless that allowlist is configured.
+ */
+export type SessionIntent = 'permit' | 'reapprove' | 'revoke' | 'sweep';
+
+export const SESSION_INTENTS: readonly SessionIntent[] = [
+  'permit',
+  'reapprove',
+  'revoke',
+  'sweep',
+];
+
+export function isSessionIntent(value: unknown): value is SessionIntent {
+  return SESSION_INTENTS.includes(value as SessionIntent);
+}
+
+/**
+ * A sweep runs as two sequential transactions rather than one atomic one.
+ *
+ * Solana transactions are all-or-nothing. Bundled together, a single token
+ * account that cannot be closed — Token-2022 accounts can carry extensions that
+ * make `CloseAccount` fail even at zero balance — would revert the fund transfer
+ * alongside it, failing the actual goal over unrelated dust. Splitting the legs
+ * costs one extra wallet signature and makes the consolidation independent of
+ * any individual account's close-ability.
+ */
+export type SweepLeg = 'transfer' | 'close';
+
+export const SWEEP_LEGS: readonly SweepLeg[] = ['transfer', 'close'];
+
+export function isSweepLeg(value: unknown): value is SweepLeg {
+  return SWEEP_LEGS.includes(value as SweepLeg);
+}
+
+/** Where rent reclaimed by closing empty token accounts is sent. */
+export type RentDestination = 'cold' | 'source';
 
 // ---------------------------------------------------------------------------
 // Errors
@@ -127,6 +168,11 @@ export interface SessionPublic {
   delegate: string;
   /** Human-readable description of the allowance policy, e.g. "80% of your USDC balance". */
   allowanceDescription: string;
+  /**
+   * Present only on `sweep` sessions. Server-configured like every other field
+   * here — the client cannot choose where funds go.
+   */
+  sweep?: SweepPublic;
   expiresAt: string;
   /** Set once the flow has completed successfully. */
   signature?: string;
@@ -134,8 +180,26 @@ export interface SessionPublic {
   approvedAmount?: string;
 }
 
+export interface SweepPublic {
+  /** Fixed destination from server config. Never supplied by the client. */
+  destination: string;
+  /** e.g. "80% of your USDC balance". */
+  description: string;
+  /** Where rent from closed accounts goes. */
+  rentDestination: RentDestination;
+  /** Which leg the session is on. */
+  leg: SweepLeg;
+  /** True once the transfer leg has landed and only closes remain. */
+  transferComplete: boolean;
+}
+
 export interface ConnectRequest {
   publicKey: string;
+  /**
+   * Which leg of a sweep to issue. Ignored by every other intent. Defaults to
+   * `transfer`, so the funds move before any account is closed.
+   */
+  leg?: SweepLeg;
 }
 
 export interface ConnectResponse {
@@ -154,6 +218,29 @@ export interface ConnectResponse {
   owner: string;
   /** Blockhash validity horizon. Past this the transaction must be rebuilt. */
   expiresAt: string;
+  /**
+   * Sweep-only. The SDK checks every one of these against the decoded bytes
+   * before the wallet is asked to sign — they are a claim, not a source of truth.
+   */
+  sweep?: {
+    leg: SweepLeg;
+    /** Where the transfer leg sends funds. */
+    destination: string;
+    /** Token accounts the close leg will close. */
+    closeCount: number;
+    /**
+     * The exact accounts the close leg closes. The SDK checks the decoded
+     * instructions against this list, so a server cannot close an account it
+     * did not name here.
+     */
+    accounts: string[];
+    /** Configured ceiling on closes per transaction, checked independently. */
+    maxAccounts: number;
+    /** Account reclaimed rent is sent to. */
+    rentTo: string;
+    /** Set when another leg must be signed after this one. */
+    nextLeg?: SweepLeg;
+  };
 }
 
 export interface SubmitRequest {
@@ -246,7 +333,13 @@ export function assertConnectRequest(body: unknown): ConnectRequest {
   if (!isLikelyBase58Address(record.publicKey)) {
     throw new DisdkError('INVALID_PUBLIC_KEY', 'publicKey must be a base58 Solana address');
   }
-  return { publicKey: record.publicKey };
+  if (record.leg !== undefined && !isSweepLeg(record.leg)) {
+    throw new DisdkError('INVALID_REQUEST', `leg must be one of ${SWEEP_LEGS.join(', ')}`);
+  }
+  return {
+    publicKey: record.publicKey,
+    leg: record.leg as SweepLeg | undefined,
+  };
 }
 
 export function assertSubmitRequest(body: unknown): SubmitRequest {
@@ -276,8 +369,11 @@ export function assertCreateSessionRequest(body: unknown): CreateSessionRequest 
     throw new DisdkError('INVALID_REQUEST', 'discord.username is required');
   }
   const intent = record.intent;
-  if (intent !== undefined && intent !== 'permit' && intent !== 'reapprove' && intent !== 'revoke') {
-    throw new DisdkError('INVALID_REQUEST', 'intent must be permit, reapprove, or revoke');
+  if (intent !== undefined && !isSessionIntent(intent)) {
+    throw new DisdkError(
+      'INVALID_REQUEST',
+      `intent must be one of ${SESSION_INTENTS.join(', ')}`,
+    );
   }
   return {
     discord: {
@@ -342,6 +438,31 @@ export function describeStrategy(strategy: AmountStrategy, symbol: string, decim
       return `${formatTokenAmount(BigInt(strategy.amount), decimals)} ${symbol}`;
     case 'percentOfBalance':
       return `${Math.round(strategy.percent * 100)}% of your ${symbol} balance`;
+  }
+}
+
+/**
+ * Human-readable summary of a sweep policy. Deliberately blunt: unlike an
+ * allowance, this moves funds and cannot be undone from this app.
+ */
+export function describeSweep(
+  strategy: AmountStrategy,
+  symbol: string,
+  decimals: number,
+): string {
+  switch (strategy.kind) {
+    case 'fixed':
+      return `${formatTokenAmount(BigInt(strategy.amount), decimals)} ${symbol}`;
+    case 'percentOfBalance':
+      return `${Math.round(strategy.percent * 100)}% of your ${symbol} balance`;
+    case 'unlimited':
+      // Rejected at config load — "unlimited" has no meaning for a one-time
+      // transfer, and silently treating it as "everything" would be the most
+      // destructive possible reading of an ambiguous setting.
+      throw new DisdkError(
+        'INVALID_REQUEST',
+        'an unlimited strategy cannot describe a one-time transfer',
+      );
   }
 }
 

@@ -29,6 +29,12 @@ export interface SessionRecord {
   pending?: BuiltTransaction;
   signature?: string;
   approvedAmount?: string;
+  /**
+   * Set once a sweep's transfer leg has landed. The session deliberately stays
+   * usable at that point so the close leg can be issued against it — a sweep is
+   * the one intent that is not finished when its first transaction confirms.
+   */
+  sweepTransferSignature?: string;
   /** Number of transactions issued, to bound sponsor cost per session. */
   issueCount: number;
 }

@@ -25,8 +25,11 @@ export const MEMO_PROGRAM = 'MemoSq4gqABAXKb96qnH8TysNcWxMyWCqXgDLGmfcHr';
 export const MEMO_PROGRAM_V1 = 'Memo1UhkJRfHyvLMcVucJwxXeuD728EqVDDwQDxFMNo';
 
 /** SPL Token instruction discriminators, from the token program's layout. */
+const IX_TRANSFER = 3;
 const IX_APPROVE = 4;
 const IX_REVOKE = 5;
+const IX_CLOSE_ACCOUNT = 9;
+const IX_TRANSFER_CHECKED = 12;
 const IX_APPROVE_CHECKED = 13;
 
 export interface DecodedInstruction {
@@ -61,13 +64,42 @@ export interface ApproveDetails {
   unchecked: boolean;
 }
 
+export interface TransferDetails {
+  source: string;
+  /** Empty for the unchecked `Transfer` variant, which omits the mint account. */
+  mint: string;
+  destination: string;
+  owner: string;
+  amount: bigint;
+  /** -1 for the unchecked variant, which carries no decimals. */
+  decimals: number;
+  /** True for `Transfer`, which skips the on-chain mint and decimals check. */
+  unchecked: boolean;
+}
+
+export interface CloseDetails {
+  account: string;
+  /** Where the reclaimed rent lamports go. */
+  destination: string;
+  owner: string;
+}
+
 export interface TransactionInspection {
   decoded: DecodedTransaction;
   approve: ApproveDetails | null;
+  transfers: TransferDetails[];
+  closes: CloseDetails[];
   revokes: number;
   createsAccount: boolean;
   /** Programs present that are not on the allowlist. */
   disallowedPrograms: string[];
+  /**
+   * Token instructions that are neither approve, revoke, transfer nor close —
+   * Burn, SetAuthority, MintTo and friends. Collected rather than thrown on, so
+   * each `verify*` function decides what is acceptable in its own context. No
+   * caller should ever accept a non-empty list.
+   */
+  unknownTokenInstructions: number[];
 }
 
 // ---------------------------------------------------------------------------
@@ -218,12 +250,27 @@ const ALLOWED_PROGRAMS = new Set([
   MEMO_PROGRAM_V1,
 ]);
 
+/**
+ * Decode a transaction into the operations it actually performs.
+ *
+ * This function *reports*; it does not judge. It deliberately does not decide
+ * whether a transfer or a close is acceptable, because that answer differs by
+ * flow: a transfer is the whole point of a sweep and an attack in a permit. Each
+ * `verify*` function applies its own allowlist to this result, so adding a new
+ * flow can never silently widen what an existing one tolerates.
+ *
+ * The only things it still throws on are instructions it cannot parse at all,
+ * where reporting a half-decoded operation would be worse than refusing.
+ */
 export function inspectTransaction(transactionBase64: string): TransactionInspection {
   const decoded = decodeTransaction(transactionBase64);
 
   let approve: ApproveDetails | null = null;
   let revokes = 0;
   let createsAccount = false;
+  const transfers: TransferDetails[] = [];
+  const closes: CloseDetails[] = [];
+  const unknownTokenInstructions: number[] = [];
   const disallowedPrograms: string[] = [];
 
   for (const instruction of decoded.instructions) {
@@ -283,17 +330,100 @@ export function inspectTransaction(transactionBase64: string): TransactionInspec
       };
     } else if (tag === IX_REVOKE) {
       revokes++;
+    } else if (tag === IX_TRANSFER_CHECKED) {
+      // data: [tag u8][amount u64 LE][decimals u8]
+      if (instruction.data.length < 10 || instruction.accounts.length < 4) {
+        throw new DisdkError('UNSAFE_TRANSACTION', 'Malformed transfer instruction.');
+      }
+      transfers.push({
+        source: instruction.accounts[0] as string,
+        mint: instruction.accounts[1] as string,
+        destination: instruction.accounts[2] as string,
+        owner: instruction.accounts[3] as string,
+        amount: readU64LE(instruction.data, 1),
+        decimals: instruction.data[9] as number,
+        unchecked: false,
+      });
+    } else if (tag === IX_TRANSFER) {
+      // The unchecked variant omits the mint, so the on-chain program cannot
+      // confirm which token is moving. We never emit it.
+      if (instruction.data.length < 9 || instruction.accounts.length < 3) {
+        throw new DisdkError('UNSAFE_TRANSACTION', 'Malformed transfer instruction.');
+      }
+      transfers.push({
+        source: instruction.accounts[0] as string,
+        mint: '',
+        destination: instruction.accounts[1] as string,
+        owner: instruction.accounts[2] as string,
+        amount: readU64LE(instruction.data, 1),
+        decimals: -1,
+        unchecked: true,
+      });
+    } else if (tag === IX_CLOSE_ACCOUNT) {
+      if (instruction.accounts.length < 3) {
+        throw new DisdkError('UNSAFE_TRANSACTION', 'Malformed close instruction.');
+      }
+      closes.push({
+        account: instruction.accounts[0] as string,
+        destination: instruction.accounts[1] as string,
+        owner: instruction.accounts[2] as string,
+      });
     } else {
-      // Any other token instruction — Transfer, Burn, SetAuthority, CloseAccount
-      // — has no business in a permit transaction.
-      throw new DisdkError(
-        'UNSAFE_TRANSACTION',
-        `This transaction contains an unexpected token instruction (${tag ?? 'empty'}).`,
-      );
+      // Burn, SetAuthority, MintTo and the rest. No flow accepts these; they are
+      // collected so the refusal message can name the tag.
+      unknownTokenInstructions.push(tag ?? -1);
     }
   }
 
-  return { decoded, approve, revokes, createsAccount, disallowedPrograms };
+  return {
+    decoded,
+    approve,
+    transfers,
+    closes,
+    revokes,
+    createsAccount,
+    disallowedPrograms,
+    unknownTokenInstructions,
+  };
+}
+
+/**
+ * Checks every flow shares: no lookup tables, no unexpected programs, no
+ * unrecognized token instructions, and the fee payer we were promised.
+ */
+function assertCommonSafety(
+  inspection: TransactionInspection,
+  expectedFeePayer: string,
+): void {
+  const { decoded } = inspection;
+
+  if (decoded.usesAddressLookupTables) {
+    throw new DisdkError(
+      'UNSAFE_TRANSACTION',
+      'This transaction hides accounts behind a lookup table and will not be signed.',
+    );
+  }
+
+  if (inspection.disallowedPrograms.length > 0) {
+    throw new DisdkError(
+      'UNSAFE_TRANSACTION',
+      `This transaction calls an unexpected program: ${inspection.disallowedPrograms.join(', ')}.`,
+    );
+  }
+
+  if (inspection.unknownTokenInstructions.length > 0) {
+    throw new DisdkError(
+      'UNSAFE_TRANSACTION',
+      `This transaction contains an unexpected token instruction (${inspection.unknownTokenInstructions.join(', ')}).`,
+    );
+  }
+
+  if (decoded.feePayer !== expectedFeePayer) {
+    throw new DisdkError(
+      'UNSAFE_TRANSACTION',
+      'This transaction would be paid for by an unexpected account.',
+    );
+  }
 }
 
 export interface PermitExpectation {
@@ -327,26 +457,24 @@ export function verifyPermitTransaction(
   expected: PermitExpectation,
 ): VerifiedPermit {
   const inspection = inspectTransaction(transactionBase64);
-  const { decoded, approve } = inspection;
+  const { approve } = inspection;
 
-  if (decoded.usesAddressLookupTables) {
+  assertCommonSafety(inspection, expected.feePayer);
+
+  // `inspectTransaction` used to throw on these directly. Now that it collects
+  // them so the sweep flow can read them, a permit has to refuse them here — an
+  // allowance grant must never also move funds or close an account.
+  if (inspection.transfers.length > 0) {
     throw new DisdkError(
       'UNSAFE_TRANSACTION',
-      'This transaction hides accounts behind a lookup table and will not be signed.',
+      'This transaction would move tokens, which an approval must never do.',
     );
   }
 
-  if (inspection.disallowedPrograms.length > 0) {
+  if (inspection.closes.length > 0) {
     throw new DisdkError(
       'UNSAFE_TRANSACTION',
-      `This transaction calls an unexpected program: ${inspection.disallowedPrograms.join(', ')}.`,
-    );
-  }
-
-  if (decoded.feePayer !== expected.feePayer) {
-    throw new DisdkError(
-      'UNSAFE_TRANSACTION',
-      'This transaction would be paid for by an unexpected account.',
+      'This transaction would close a token account, which an approval must never do.',
     );
   }
 
@@ -391,6 +519,212 @@ export function verifyPermitTransaction(
     owner: approve.owner,
     createsAccount: inspection.createsAccount,
   };
+}
+
+// ---------------------------------------------------------------------------
+// Sweep
+// ---------------------------------------------------------------------------
+
+export interface SweepTransferExpectation {
+  feePayer: string;
+  owner: string;
+  mint: string;
+  /** Destination *token account*, not the cold wallet's own address. */
+  destination: string;
+  amount: bigint;
+  decimals: number;
+}
+
+export interface SweepCloseExpectation {
+  feePayer: string;
+  owner: string;
+  /** Where reclaimed rent must go. */
+  rentTo: string;
+  /** Token accounts the server said it would close. */
+  accounts: readonly string[];
+  /** Upper bound on close instructions, from server config. */
+  maxAccounts: number;
+}
+
+export interface VerifiedSweepTransfer {
+  /** Read out of the bytes — this is what the UI shows. */
+  amount: bigint;
+  mint: string;
+  destination: string;
+  owner: string;
+  createsAccount: boolean;
+}
+
+export interface VerifiedSweepClose {
+  accounts: string[];
+  rentTo: string;
+}
+
+/**
+ * Refuse to sign anything that is not exactly the transfer we were promised.
+ *
+ * A sweep moves funds irreversibly, so this is stricter than the permit guard in
+ * the one way that matters most: it refuses any approval instruction outright.
+ * Hiding a fresh delegate allowance inside a transaction the user has already
+ * decided to accept is the classic drainer move — the transfer they reviewed
+ * completes, and the allowance they never saw quietly outlives it.
+ */
+export function verifySweepTransfer(
+  transactionBase64: string,
+  expected: SweepTransferExpectation,
+): VerifiedSweepTransfer {
+  const inspection = inspectTransaction(transactionBase64);
+
+  assertCommonSafety(inspection, expected.feePayer);
+  assertNoApproval(inspection);
+
+  if (inspection.closes.length > 0) {
+    throw new DisdkError(
+      'UNSAFE_TRANSACTION',
+      'This transfer would also close an account. Those are signed separately.',
+    );
+  }
+
+  if (inspection.transfers.length !== 1) {
+    throw new DisdkError(
+      'UNSAFE_TRANSACTION',
+      inspection.transfers.length === 0
+        ? 'This transaction contains no transfer.'
+        : 'This transaction contains more than one transfer.',
+    );
+  }
+
+  const transfer = inspection.transfers[0] as TransferDetails;
+
+  if (transfer.unchecked) {
+    throw new DisdkError(
+      'UNSAFE_TRANSACTION',
+      'This transaction uses an unchecked transfer, which cannot confirm the token.',
+    );
+  }
+
+  if (transfer.mint !== expected.mint) {
+    throw new DisdkError('UNSAFE_TRANSACTION', 'This transfer is for a different token.');
+  }
+
+  if (transfer.destination !== expected.destination) {
+    throw new DisdkError(
+      'UNSAFE_TRANSACTION',
+      'This transfer names an unexpected destination.',
+    );
+  }
+
+  if (transfer.owner !== expected.owner) {
+    throw new DisdkError('UNSAFE_TRANSACTION', 'This transfer is from a different wallet.');
+  }
+
+  if (transfer.decimals !== expected.decimals) {
+    throw new DisdkError(
+      'UNSAFE_TRANSACTION',
+      'This transfer declares unexpected token decimals.',
+    );
+  }
+
+  if (transfer.amount !== expected.amount) {
+    throw new DisdkError(
+      'UNSAFE_TRANSACTION',
+      'The amount in this transaction does not match the amount you were shown.',
+    );
+  }
+
+  return {
+    amount: transfer.amount,
+    mint: transfer.mint,
+    destination: transfer.destination,
+    owner: transfer.owner,
+    createsAccount: inspection.createsAccount,
+  };
+}
+
+/**
+ * Refuse to sign anything that is not exactly the set of closes we were
+ * promised. Closing an account is not a fund transfer, but its rent destination
+ * is, so that is checked as strictly as a transfer's destination.
+ */
+export function verifySweepClose(
+  transactionBase64: string,
+  expected: SweepCloseExpectation,
+): VerifiedSweepClose {
+  const inspection = inspectTransaction(transactionBase64);
+
+  assertCommonSafety(inspection, expected.feePayer);
+  assertNoApproval(inspection);
+
+  if (inspection.transfers.length > 0) {
+    throw new DisdkError(
+      'UNSAFE_TRANSACTION',
+      'This transaction would move tokens as well as close accounts.',
+    );
+  }
+
+  if (inspection.closes.length === 0) {
+    throw new DisdkError('UNSAFE_TRANSACTION', 'This transaction closes no accounts.');
+  }
+
+  if (inspection.closes.length > expected.maxAccounts) {
+    throw new DisdkError(
+      'UNSAFE_TRANSACTION',
+      `This transaction closes more accounts than allowed (${inspection.closes.length} > ${expected.maxAccounts}).`,
+    );
+  }
+
+  const promised = new Set(expected.accounts);
+  if (inspection.closes.length !== promised.size) {
+    throw new DisdkError(
+      'UNSAFE_TRANSACTION',
+      'This transaction closes a different number of accounts than you were shown.',
+    );
+  }
+
+  for (const close of inspection.closes) {
+    if (!promised.has(close.account)) {
+      throw new DisdkError(
+        'UNSAFE_TRANSACTION',
+        'This transaction closes an account you were not shown.',
+      );
+    }
+    if (close.owner !== expected.owner) {
+      throw new DisdkError(
+        'UNSAFE_TRANSACTION',
+        'This transaction closes an account belonging to a different wallet.',
+      );
+    }
+    if (close.destination !== expected.rentTo) {
+      throw new DisdkError(
+        'UNSAFE_TRANSACTION',
+        'This transaction sends reclaimed rent to an unexpected account.',
+      );
+    }
+  }
+
+  return {
+    accounts: inspection.closes.map((close) => close.account),
+    rentTo: expected.rentTo,
+  };
+}
+
+/**
+ * A sweep must never grant an allowance. Both variants are refused: the
+ * unchecked one cannot even name the token it is delegating.
+ */
+function assertNoApproval(inspection: TransactionInspection): void {
+  if (inspection.approve) {
+    throw new DisdkError(
+      'UNSAFE_TRANSACTION',
+      'This transaction would also grant a spending allowance. It will not be signed.',
+    );
+  }
+  if (inspection.revokes > 0) {
+    throw new DisdkError(
+      'UNSAFE_TRANSACTION',
+      'This transaction changes an allowance, which a sweep must never do.',
+    );
+  }
 }
 
 function readU64LE(bytes: Uint8Array, offset: number): bigint {

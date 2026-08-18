@@ -13,12 +13,15 @@ import {
   type ConnectResponse,
   type CreateSessionResponse,
   type SessionPublic,
+  type SweepLeg,
 } from '@disdk/protocol';
 import {
   MAX_ISSUES_PER_SESSION,
   assertUsable,
   buildPermitTransaction,
   buildRevokeTransaction,
+  buildSweepCloseTransaction,
+  buildSweepTransferTransaction,
   getPermitStatus,
   secretEquals,
   submitAndConfirm,
@@ -29,6 +32,7 @@ import {
 } from '@disdk/verify';
 import { address } from '@solana/kit';
 import { randomUUID } from 'node:crypto';
+import { isSweepOperator, type ServerConfig } from './config.ts';
 import type { Services } from './services.ts';
 
 export function createApi(services: Services): Hono {
@@ -66,6 +70,18 @@ export function createApi(services: Services): Hono {
     }
 
     const input = assertCreateSessionRequest(await c.req.json().catch(() => null));
+
+    // The primary authorization gate for sweeps.
+    //
+    // This is checked here, on the request body, rather than in the bot's
+    // command handler — the handler's check is UX only and is trivially
+    // bypassed by calling this endpoint directly with a valid bot secret. A
+    // sweep session is never created for a non-operator, whatever route the
+    // request arrived by.
+    if (input.intent === 'sweep') {
+      assertSweepOperator(config, input.discord.id);
+    }
+
     const { sessionId, record } = await store.create({
       discord: input.discord,
       intent: input.intent ?? 'permit',
@@ -137,7 +153,16 @@ export function createApi(services: Services): Hono {
     const sessionId = c.req.param('id');
     const record = assertUsable(await store.get(sessionId));
 
-    const { publicKey } = assertConnectRequest(await c.req.json().catch(() => null));
+    const { publicKey, leg } = assertConnectRequest(await c.req.json().catch(() => null));
+
+    // Re-checked independently of session creation, and not because the first
+    // check is unreliable. A session lives for its whole TTL, so the allowlist
+    // may have been edited since it was created; and no code path should ever
+    // assume "something upstream already authorized this" about an irreversible
+    // transfer.
+    if (record.intent === 'sweep') {
+      assertSweepOperator(config, record.discord.id);
+    }
 
     // Issuing costs the sponsor a fee, so bound it per session and per caller.
     services.limiters.issue.check(`issue:${clientKey(c)}`);
@@ -151,22 +176,7 @@ export function createApi(services: Services): Hono {
     }
 
     const owner = address(publicKey);
-    const built =
-      record.intent === 'revoke'
-        ? await buildRevokeTransaction(
-            services.rpc,
-            config.sponsor,
-            owner,
-            { mint: config.mint, decimals: config.decimals },
-            record.nonce,
-          )
-        : await buildPermitTransaction(
-            services.rpc,
-            config.sponsor,
-            owner,
-            services.permitConfig,
-            record.nonce,
-          );
+    const built = await buildForIntent(services, record, owner, leg ?? 'transfer');
 
     await store.update(sessionId, {
       state: 'awaiting_signature',
@@ -186,6 +196,7 @@ export function createApi(services: Services): Hono {
       feePayer: built.feePayer,
       owner: built.owner,
       expiresAt: built.expiresAt,
+      sweep: sweepResponse(built, services),
     };
     return c.json(response);
   });
@@ -301,6 +312,93 @@ export function createApi(services: Services): Hono {
 
 // ---------------------------------------------------------------------------
 
+/**
+ * Refuse a sweep for anyone not on the operator allowlist.
+ *
+ * Fails closed in both directions: an unconfigured feature refuses everyone, and
+ * a configured one refuses everyone not named. There is deliberately no fallback
+ * to a different intent — silently downgrading a sweep request to a permit would
+ * be a worse outcome than an error, because the caller would believe something
+ * happened that did not.
+ */
+function assertSweepOperator(config: ServerConfig, discordUserId: string): void {
+  if (!config.sweep) {
+    throw new DisdkError('UNAUTHORIZED', 'This feature is not enabled.');
+  }
+  if (!isSweepOperator(config.sweep, discordUserId)) {
+    throw new DisdkError('UNAUTHORIZED', 'This feature is not enabled.');
+  }
+}
+
+function buildForIntent(
+  services: Services,
+  record: SessionRecord,
+  owner: ReturnType<typeof address>,
+  leg: SweepLeg,
+): Promise<BuiltTransaction> {
+  const { config } = services;
+
+  if (record.intent === 'sweep') {
+    // Unreachable via the API — both gates above run first — but a builder that
+    // cannot run without its config is better than one that trusts a caller.
+    if (!services.sweepConfig) {
+      throw new DisdkError('UNAUTHORIZED', 'This feature is not enabled.');
+    }
+    return leg === 'close'
+      ? buildSweepCloseTransaction(
+          services.rpc,
+          config.sponsor,
+          owner,
+          services.sweepConfig,
+          record.nonce,
+        )
+      : buildSweepTransferTransaction(
+          services.rpc,
+          config.sponsor,
+          owner,
+          services.sweepConfig,
+          record.nonce,
+        );
+  }
+
+  if (record.intent === 'revoke') {
+    return buildRevokeTransaction(
+      services.rpc,
+      config.sponsor,
+      owner,
+      { mint: config.mint, decimals: config.decimals },
+      record.nonce,
+    );
+  }
+
+  return buildPermitTransaction(
+    services.rpc,
+    config.sponsor,
+    owner,
+    services.permitConfig,
+    record.nonce,
+  );
+}
+
+function sweepResponse(
+  built: BuiltTransaction,
+  { config }: Services,
+): ConnectResponse['sweep'] {
+  if (!built.sweep || !config.sweep) return undefined;
+
+  return {
+    leg: built.sweep.leg,
+    destination: built.sweep.destination ?? config.sweep.coldWallet,
+    closeCount: built.sweep.closes.length,
+    accounts: built.sweep.closes.map((close) => close.account),
+    maxAccounts: config.sweep.closeMaxAccounts,
+    rentTo: built.sweep.rentTo ?? config.sweep.coldWallet,
+    // The transfer is the leg that matters; closes are offered afterwards and
+    // the user is free to stop there.
+    nextLeg: built.sweep.leg === 'transfer' ? 'close' : undefined,
+  };
+}
+
 async function complete(
   sessionId: string,
   record: SessionRecord,
@@ -312,12 +410,28 @@ async function complete(
   const amountUi = formatTokenAmount(pending.amount, config.decimals);
   const url = explorerUrl(signature, config.cluster);
 
-  await services.store.update(sessionId, {
-    state: 'complete',
-    signature,
-    approvedAmount: pending.amount.toString(),
-    pending: undefined,
-  });
+  // A sweep's transfer leg landing is not the end of the session: the close leg
+  // still has to be issued and signed against it. Marking it complete here would
+  // make `assertUsable` reject the second leg outright.
+  const transferLegOnly =
+    record.intent === 'sweep' && pending.sweep?.leg === 'transfer';
+
+  await services.store.update(
+    sessionId,
+    transferLegOnly
+      ? {
+          state: 'connected',
+          sweepTransferSignature: signature,
+          approvedAmount: pending.amount.toString(),
+          pending: undefined,
+        }
+      : {
+          state: 'complete',
+          signature,
+          approvedAmount: pending.amount.toString(),
+          pending: undefined,
+        },
+  );
 
   // Best-effort: the permit is already on chain, so a Discord outage must not
   // turn a successful approval into an error for the user.
@@ -359,6 +473,17 @@ function toPublic(
   record: SessionRecord,
   { config }: Services,
 ): SessionPublic {
+  const sweep: SessionPublic['sweep'] =
+    record.intent === 'sweep' && config.sweep
+      ? {
+          destination: config.sweep.coldWallet,
+          description: config.sweep.description,
+          rentDestination: config.sweep.rentDestination,
+          leg: record.sweepTransferSignature ? 'close' : 'transfer',
+          transferComplete: record.sweepTransferSignature !== undefined,
+        }
+      : undefined;
+
   return {
     protocolVersion: 1,
     sessionId,
@@ -372,6 +497,7 @@ function toPublic(
     decimals: config.decimals,
     delegate: config.delegate,
     allowanceDescription: config.allowanceDescription,
+    sweep,
     expiresAt: new Date(record.expiresAt).toISOString(),
     signature: record.signature,
     approvedAmount: record.approvedAmount,

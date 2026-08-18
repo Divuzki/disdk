@@ -14,6 +14,7 @@ import {
   none,
   some,
   type Address,
+  type ReadonlyUint8Array,
 } from '@solana/kit';
 import { AccountState, TOKEN_PROGRAM_ADDRESS, getTokenEncoder } from '@solana-program/token';
 import { deriveAta } from './token.js';
@@ -25,6 +26,21 @@ export interface MockTokenAccount {
   amount: bigint;
   delegate?: Address;
   delegatedAmount?: bigint;
+  /** Defaults to the classic token program. Set for Token-2022 accounts. */
+  tokenProgram?: Address;
+}
+
+function encodeTokenAccount(account: MockTokenAccount): ReadonlyUint8Array {
+  return getTokenEncoder().encode({
+    mint: account.mint,
+    owner: account.owner,
+    amount: account.amount,
+    delegate: account.delegate ? some(account.delegate) : none(),
+    state: AccountState.Initialized,
+    isNative: none(),
+    delegatedAmount: account.delegatedAmount ?? 0n,
+    closeAuthority: none(),
+  });
 }
 
 export interface MockRpcOptions {
@@ -54,16 +70,7 @@ export function createMockRpc(options: MockRpcOptions = {}): MockRpc {
           const account = tokenAccounts.get(addr);
           if (!account) return { context: { slot: 1n }, value: null };
 
-          const encoded = getTokenEncoder().encode({
-            mint: account.mint,
-            owner: account.owner,
-            amount: account.amount,
-            delegate: account.delegate ? some(account.delegate) : none(),
-            state: AccountState.Initialized,
-            isNative: none(),
-            delegatedAmount: account.delegatedAmount ?? 0n,
-            closeAuthority: none(),
-          });
+          const encoded = encodeTokenAccount(account);
 
           return {
             context: { slot: 1n },
@@ -71,12 +78,41 @@ export function createMockRpc(options: MockRpcOptions = {}): MockRpc {
               data: [getBase64Decoder().decode(encoded), 'base64'],
               executable: false,
               lamports: 2_039_280n,
-              owner: TOKEN_PROGRAM_ADDRESS,
+              owner: account.tokenProgram ?? TOKEN_PROGRAM_ADDRESS,
               rentEpoch: 0n,
               space: BigInt(encoded.length),
             },
           };
         },
+      };
+    },
+
+    getTokenAccountsByOwner(
+      owner: Address,
+      filter: { programId: Address },
+      _config: { encoding: 'base64' },
+    ) {
+      return {
+        send: async () => ({
+          context: { slot: 1n },
+          value: [...tokenAccounts.entries()]
+            .filter(
+              ([, account]) =>
+                account.owner === owner &&
+                (account.tokenProgram ?? TOKEN_PROGRAM_ADDRESS) === filter.programId,
+            )
+            .map(([pubkey, account]) => ({
+              pubkey,
+              account: {
+                data: [getBase64Decoder().decode(encodeTokenAccount(account)), 'base64'],
+                executable: false,
+                lamports: 2_039_280n,
+                owner: filter.programId,
+                rentEpoch: 0n,
+                space: 165n,
+              },
+            })),
+        }),
       };
     },
 

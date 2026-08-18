@@ -15,6 +15,23 @@ export interface ReviewDetails {
   publicKey: string;
   createsAccount: boolean;
   isUnlimited: boolean;
+  /**
+   * Present only for a sweep. Its presence changes the screen from "you are
+   * granting an allowance" to "you are moving funds", which are different enough
+   * that sharing one layout without a discriminator would be a bug waiting to
+   * happen.
+   */
+  sweep?: SweepReviewDetails;
+}
+
+export interface SweepReviewDetails {
+  leg: 'transfer' | 'close';
+  /** Destination token account, read out of the bytes. */
+  destination: string;
+  /** Number of accounts the close leg will close. */
+  closeCount: number;
+  /** Where reclaimed rent goes. */
+  rentTo: string;
 }
 
 export interface SuccessDetails {
@@ -213,6 +230,8 @@ export class DisdkModal {
   }
 
   showReview(details: ReviewDetails): void {
+    if (details.sweep) return this.#showSweepReview(details, details.sweep);
+
     const fragment = document.createDocumentFragment();
 
     const amountBox = el('div', 'amount');
@@ -246,6 +265,73 @@ export class DisdkModal {
 
     const actions = el('div', 'actions');
     const approve = el('button', 'primary', 'Approve in wallet') as HTMLButtonElement;
+    approve.type = 'button';
+    approve.addEventListener('click', () => this.callbacks.onApprove());
+    const cancel = el('button', 'secondary', 'Cancel') as HTMLButtonElement;
+    cancel.type = 'button';
+    cancel.addEventListener('click', () => this.callbacks.onCancel());
+    actions.append(approve, cancel);
+    fragment.append(actions);
+
+    this.#setBody(fragment, approve);
+  }
+
+  /**
+   * The sweep review screen.
+   *
+   * Kept deliberately separate from the allowance screen rather than
+   * parameterised into it. An allowance is revocable and this is not, so every
+   * reassurance that belongs on the permit screen ("you can revoke this any
+   * time") would be a lie here.
+   */
+  #showSweepReview(details: ReviewDetails, sweep: SweepReviewDetails): void {
+    const fragment = document.createDocumentFragment();
+
+    const amountBox = el('div', 'amount');
+    const value = el('div', 'value');
+
+    if (sweep.leg === 'close') {
+      value.textContent = `${sweep.closeCount} account${sweep.closeCount === 1 ? '' : 's'}`;
+      amountBox.append(value);
+      amountBox.append(el('div', 'label', 'Empty token accounts you are closing'));
+    } else {
+      value.textContent = `${formatTokenAmount(details.amount, details.decimals)} ${details.symbol}`;
+      amountBox.append(value);
+      amountBox.append(el('div', 'label', 'Amount leaving your wallet'));
+    }
+    fragment.append(amountBox);
+
+    const rows = el('dl', 'rows');
+    rows.append(this.#row('Wallet', `${details.walletName} · ${SHORT(details.publicKey)}`));
+    if (sweep.leg === 'transfer') {
+      rows.append(this.#row('To', SHORT(sweep.destination, 6, 6), true));
+    } else {
+      rows.append(this.#row('Rent to', SHORT(sweep.rentTo, 6, 6), true));
+    }
+    rows.append(this.#row('Network fee', 'Paid for you'));
+    fragment.append(rows);
+
+    fragment.append(
+      this.#note(
+        sweep.leg === 'close'
+          ? 'Closing an empty token account returns its rent deposit. No tokens move in this step.'
+          : 'This moves tokens out of your wallet now. It is not an allowance, and it cannot be revoked or undone from this page.',
+        sweep.leg === 'transfer',
+      ),
+    );
+
+    if (sweep.leg === 'transfer') {
+      fragment.append(
+        el('p', 'hint', 'After this you will be asked to sign once more to close empty accounts.'),
+      );
+    }
+
+    const actions = el('div', 'actions');
+    const approve = el(
+      'button',
+      'primary',
+      sweep.leg === 'close' ? 'Close accounts' : 'Transfer in wallet',
+    ) as HTMLButtonElement;
     approve.type = 'button';
     approve.addEventListener('click', () => this.callbacks.onApprove());
     const cancel = el('button', 'secondary', 'Cancel') as HTMLButtonElement;
