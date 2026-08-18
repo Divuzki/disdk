@@ -28,6 +28,7 @@ import {
   type SessionRecord,
 } from '@disdk/verify';
 import { address } from '@solana/kit';
+import { randomUUID } from 'node:crypto';
 import type { Services } from './services.ts';
 
 export function createApi(services: Services): Hono {
@@ -69,6 +70,40 @@ export function createApi(services: Services): Hono {
       discord: input.discord,
       intent: input.intent ?? 'permit',
       interactionToken: input.interactionToken,
+      ttlMs: config.sessionTtlMs,
+    });
+
+    const response: CreateSessionResponse = {
+      sessionId,
+      url: `${config.appOrigin}/?ds=${encodeURIComponent(sessionId)}`,
+      expiresAt: new Date(record.expiresAt).toISOString(),
+    };
+    return c.json(response, 201);
+  });
+
+  // -------------------------------------------------------------------------
+  // Session creation — browser, no Discord identity
+  //
+  // The connect page calls this when it was opened without a `?ds=` link, so a
+  // visitor can run the flow without a Discord round trip. The resulting
+  // session proves nothing about who the user is, which is why it is opt-in and
+  // why the identity it carries is explicitly marked anonymous.
+  // -------------------------------------------------------------------------
+
+  app.post('/api/sessions/anonymous', async (c) => {
+    if (!config.allowAnonymousSessions) {
+      throw new DisdkError(
+        'UNAUTHORIZED',
+        'Anonymous sessions are disabled. Run /connect in Discord to get a link.',
+      );
+    }
+
+    // Unauthenticated, so it is the one creation path a stranger can reach.
+    services.limiters.session.check(`anon:${clientKey(c)}`);
+
+    const { sessionId, record } = await store.create({
+      discord: { id: `anonymous:${randomUUID()}`, username: 'guest' },
+      intent: 'permit',
       ttlMs: config.sessionTtlMs,
     });
 

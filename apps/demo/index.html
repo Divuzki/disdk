@@ -98,7 +98,8 @@
       <h1>Connect a Solana wallet</h1>
       <p class="lede">
         This page is the other half of a Discord <code>/connect</code> link. Open it with a
-        <code>?ds=&lt;session&gt;</code> parameter and the button below runs the whole flow.
+        <code>?ds=&lt;session&gt;</code> parameter and the button below runs the whole flow —
+        or open it bare, and it mints an anonymous session for itself.
       </p>
 
       <section>
@@ -149,6 +150,37 @@
       data-api-base="http://localhost:8787"
       data-theme="auto"
     ></script>
+
+    <!--
+      Opened without a `?ds=` link? Mint one and put it in the URL before the
+      user can click. The SDK reads the session at click time, so this only has
+      to win the race against a human, and the page still works exactly as
+      before when a real Discord link brought them here.
+    -->
+    <script>
+      (async () => {
+        const script = document.querySelector('script[data-disdk-auto]');
+        const apiBase = script?.dataset.apiBase;
+        const param = script?.dataset.sessionParam || 'ds';
+        if (!apiBase || new URLSearchParams(location.search).has(param)) return;
+
+        const button = document.getElementById('connect-wallet');
+        button?.setAttribute('disabled', '');
+        try {
+          const res = await fetch(`${apiBase}/api/sessions/anonymous`, { method: 'POST' });
+          if (!res.ok) throw new Error((await res.json().catch(() => ({}))).message || res.statusText);
+
+          const { sessionId } = await res.json();
+          const url = new URL(location.href);
+          url.searchParams.set(param, sessionId);
+          history.replaceState(null, '', url);
+        } catch (error) {
+          console.warn('[demo] could not mint a session:', error.message);
+        } finally {
+          button?.removeAttribute('disabled');
+        }
+      })();
+    </script>
 
     <!-- Optional: the page can listen to DOM events without importing anything. -->
     <script>

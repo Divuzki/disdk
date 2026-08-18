@@ -28,3 +28,18 @@ export { createRpc, withRpc } from './rpc.js';
 export type { SolanaRpc } from './rpc.js';
 
 export { loadSponsorSigner, generateSponsorKeypair } from './sponsor.js';
+
+export { buildChargeTransaction } from './charge.js';
+export type { BuiltCharge, ChargeConfig } from './charge.js';
+
+export {
+  parseChargeTerms,
+  assertWithinTerms,
+  chargeHeadroom,
+  describeTerms,
+  DEFAULT_PERIOD_MS,
+} from './terms.js';
+export type { ChargeTerms, ChargeRecord, ChargeHeadroom } from './terms.js';
+
+export { MemoryChargeLedger } from './ledger.js';
+export type { ChargeLedger } from './ledger.js';

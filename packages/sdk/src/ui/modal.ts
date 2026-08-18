@@ -230,9 +230,7 @@ export class DisdkModal {
     rows.append(this.#row('Network fee', 'Paid for you'));
     fragment.append(rows);
 
-    // The user is granting a standing allowance with no expiry. Saying so
-    // plainly, next to a revoke path, is the difference between an informed
-    // approval and the pattern drainers rely on.
+   
     fragment.append(
       this.#note(
         details.isUnlimited

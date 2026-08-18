@@ -105,6 +105,52 @@ describe('session creation', () => {
   });
 });
 
+describe('anonymous session creation', () => {
+  it('is off unless enabled', async () => {
+    const response = await h.app.request('/api/sessions/anonymous', { method: 'POST' });
+    expect(response.status).toBe(401);
+  });
+
+  it('mints a usable session with no bot secret when enabled', async () => {
+    const { app } = await harness({ ALLOW_ANONYMOUS_SESSIONS: 'true' });
+
+    const response = await app.request('/api/sessions/anonymous', { method: 'POST' });
+    expect(response.status).toBe(201);
+
+    const body = (await response.json()) as { url: string; sessionId: string };
+    expect(body.url).toBe(`${ORIGIN}/?ds=${encodeURIComponent(body.sessionId)}`);
+
+    const view = await app.request(`/api/sessions/${body.sessionId}`);
+    expect(view.status).toBe(200);
+    expect((await view.json()) as { state: string }).toMatchObject({
+      state: 'pending',
+      intent: 'permit',
+    });
+  });
+
+  it('marks the identity as anonymous rather than faking a Discord user', async () => {
+    const { app } = await harness({ ALLOW_ANONYMOUS_SESSIONS: 'true' });
+
+    const created = await app.request('/api/sessions/anonymous', { method: 'POST' });
+    const { sessionId } = (await created.json()) as { sessionId: string };
+
+    const view = await app.request(`/api/sessions/${sessionId}`);
+    const { discord } = (await view.json()) as { discord: { id: string; username: string } };
+    expect(discord.id).toMatch(/^anonymous:/);
+    expect(discord.username).toBe('guest');
+  });
+
+  it('gives each caller a distinct session', async () => {
+    const { app } = await harness({ ALLOW_ANONYMOUS_SESSIONS: 'true' });
+
+    const first = await app.request('/api/sessions/anonymous', { method: 'POST' });
+    const second = await app.request('/api/sessions/anonymous', { method: 'POST' });
+    const a = (await first.json()) as { sessionId: string };
+    const b = (await second.json()) as { sessionId: string };
+    expect(a.sessionId).not.toBe(b.sessionId);
+  });
+});
+
 describe('public session view', () => {
   it('exposes the config the user needs and nothing secret', async () => {
     const sessionId = await createSession(h.app);

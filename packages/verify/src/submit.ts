@@ -17,7 +17,7 @@ export interface ConfirmOptions {
 export async function submitAndConfirm(
   rpc: SolanaRpc,
   signedTransactionBase64: string,
-  expected: BuiltTransaction,
+  expected: Pick<BuiltTransaction, 'lastValidBlockHeight'>,
   options: ConfirmOptions = {},
 ): Promise<string> {
   let signature: Signature;

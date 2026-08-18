@@ -34,6 +34,13 @@ export interface ServerConfig {
   botApiSecret: string;
   corsOrigins: string[];
 
+  /**
+   * Let the connect page mint its own session, with no Discord identity behind
+   * it. Convenient for a demo or a non-Discord integration; off by default,
+   * because a real deployment wants the link to prove who is asking.
+   */
+  allowAnonymousSessions: boolean;
+
   discord: {
     token?: string;
     clientId?: string;
@@ -100,6 +107,7 @@ export async function loadConfig(env: NodeJS.ProcessEnv = process.env): Promise<
 
     sessionTtlMs: Number(env.SESSION_TTL_MS ?? 10 * 60 * 1000),
     botApiSecret,
+    allowAnonymousSessions: env.ALLOW_ANONYMOUS_SESSIONS === 'true',
     corsOrigins: (env.CORS_ORIGINS ?? env.APP_ORIGIN ?? 'http://localhost:5173')
       .split(',')
       .map((origin) => origin.trim())
