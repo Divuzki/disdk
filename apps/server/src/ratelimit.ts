@@ -4,14 +4,7 @@ interface Bucket {
   hits: number[];
 }
 
-/**
- * Sliding-window limiter.
- *
- * The sponsor pays a network fee for every transaction it issues, and rent when
- * it creates a token account, so an unbounded issue endpoint is a way to drain
- * the fee payer. These limits are the cheap half of that defence; the other
- * half is the per-session issue cap in `@disdk/verify`.
- */
+
 export class RateLimiter {
   readonly #buckets = new Map<string, Bucket>();
   readonly #limit: number;

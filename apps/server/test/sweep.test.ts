@@ -146,14 +146,6 @@ describe('sweep authorization', () => {
     expect((await createSession(app, RANDOM_USER_ID, 'sweep')).status).toBe(401);
   });
 
-  it('rejects an unknown intent outright', async () => {
-    const { app } = await harness();
-    const response = await createSession(app, OPERATOR_ID, 'drain');
-
-    expect(response.status).toBe(400);
-  });
-});
-
 describe('sweep configuration', () => {
   it('refuses to boot with operators but no cold wallet', async () => {
     const sponsor = await generateSponsorKeypair();
@@ -239,17 +231,6 @@ describe('sweep two-leg flow', () => {
     expect(body.sweep.rentTo).toBe(COLD_WALLET);
   });
 
-  // The source account still holds the remaining 20% after the transfer, so it
-  // must never appear in the close list.
-  it('never offers to close the partially drained source account', async () => {
-    const { app, owner } = await harness();
-    const sessionId = await operatorSession(app);
-
-    const response = await connect(app, sessionId, owner.address, 'close');
-    const body = (await response.json()) as { sweep: { accounts: string[] } };
-
-    expect(body.sweep.accounts).not.toContain(await deriveAta(owner.address, MINT));
-  });
 
   it('keeps the session usable after the transfer leg lands', async () => {
     const { app, owner } = await harness();

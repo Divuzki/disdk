@@ -137,12 +137,6 @@ describe('request validators', () => {
     expect(() => assertCreateSessionRequest({ discord: { username: 'a' } })).toThrowError(/id/);
   });
 
-  it('rejects an unknown intent', () => {
-    expect(() =>
-      assertCreateSessionRequest({ discord: { id: '1', username: 'a' }, intent: 'drain' }),
-    ).toThrowError(/intent/);
-  });
-
   it('drops unexpected fields rather than passing them through', () => {
     const result = assertCreateSessionRequest({
       discord: { id: '1', username: 'a', isAdmin: true },

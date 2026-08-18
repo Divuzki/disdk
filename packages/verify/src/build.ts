@@ -370,11 +370,7 @@ export async function buildSweepCloseTransaction(
     limit: config.closeMaxAccounts,
   });
 
-  // Hard invariant, restated here rather than trusted from the enumerator: under
-  // the default 80% strategy the source USDC account still holds the remaining
-  // 20% after the transfer leg. Closing a funded account would fail on chain,
-  // but a *stale* zero reading is the dangerous case — so re-read it directly
-  // and drop it unless it is genuinely drained.
+
   const sourceView = await readTokenAccount(rpc, owner, config.mint, tokenProgram);
   const closes = candidates.filter(
     (candidate) => candidate.address !== sourceAta || sourceView.balance === 0n,

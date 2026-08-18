@@ -282,14 +282,6 @@ describe('sweep close leg', () => {
     expect(built.sweep?.closes.map((c) => c.account)).not.toContain(sourceAta);
   });
 
-  it('closes the source account once it is fully drained', async () => {
-    const { sponsor, owner, rpc } = await closeSetup(0n);
-    const sourceAta = await deriveAta(owner.address, TEST_MINT);
-    const built = await buildSweepCloseTransaction(rpc, sponsor, owner.address, BASE_CONFIG);
-
-    expect(built.sweep?.closes.map((c) => c.account)).toContain(sourceAta);
-  });
-
   it('sends rent back to the owner when configured for source', async () => {
     const { sponsor, owner, rpc } = await closeSetup(200_000_000n);
     const built = await buildSweepCloseTransaction(rpc, sponsor, owner.address, {

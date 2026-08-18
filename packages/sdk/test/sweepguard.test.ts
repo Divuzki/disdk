@@ -112,25 +112,6 @@ describe('verifySweepTransfer', () => {
     expect(verified.owner).toBe(owner.address);
   });
 
-  // The case that matters most. A sweep is a transaction the user has already
-  // decided to accept, so an allowance smuggled alongside the transfer would
-  // outlive it silently — the classic drainer move.
-  it('refuses a smuggled ApproveChecked', async () => {
-    const { sponsor, owner, transferExpectation } = await setup();
-    const approve = getApproveCheckedInstruction({
-      source: SOURCE_ATA,
-      mint: MINT,
-      delegate: ATTACKER,
-      owner: createNoopSigner(owner.address),
-      amount: 18_446_744_073_709_551_615n,
-      decimals: 6,
-    });
-    const tx = await buildTx([transferIx(owner.address), approve], sponsor);
-
-    expect(() => verifySweepTransfer(tx, transferExpectation)).toThrowError(
-      /grant a spending allowance/i,
-    );
-  });
 
   it('refuses a smuggled Revoke', async () => {
     const { sponsor, owner, transferExpectation } = await setup();

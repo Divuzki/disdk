@@ -285,25 +285,6 @@ Anyone not on the list is still refused, at session creation and again at connec
 
 ---
 
-## Security model
-
-**The client never chooses anything that matters.** The mint, the delegate, the allowance strategy, the sweep destination, the treasury, and every price come from server configuration or from an authenticated session. The browser sends a public key.
-
-**The sponsor's signature binds the message.** Every transaction is built and partially signed server-side, leaving only the owner's slot empty. Any change to the instructions, amounts, delegate, or fee payer invalidates that signature and the network rejects it.
-
-**The SDK verifies the bytes, not the JSON.** `txguard` decodes the transaction the server sent and refuses to hand it to a wallet unless it is exactly what was promised:
-
-- an instruction allowlist — anything outside it is refused, and address lookup tables are treated as hostile because they hide accounts from inspection;
-- the amount shown on screen is read out of the decoded bytes, never from the server's JSON;
-- each flow states what it tolerates *for itself*, so adding a flow can never silently widen what an existing one accepts;
-- a checkout or a sweep refuses any approval instruction outright. Hiding a fresh allowance inside a transaction the user already decided to accept is the classic drainer move — the transfer they reviewed completes, and the allowance they never saw quietly outlives it.
-
-**Sessions are single-purpose and short-lived.** Ids are 32 bytes of CSPRNG, stored only as a SHA-256 hash, and expire (default 10 minutes). Each carries a random nonce written into the transaction as a memo, so an approval cannot be replayed into a different session to bind a wallet to the wrong account.
-
-**Anonymous sessions are opt-in.** `ALLOW_ANONYMOUS_SESSIONS=true` lets the connect page mint its own session with no Discord identity behind it. Convenient for a demo or a non-Discord integration; off by default, because a real deployment wants the link to prove who is asking.
-
----
-
 ## Mobile
 
 Android goes through Mobile Wallet Adapter, registered alongside browser extensions so both appear in one list. In-app browsers that cannot reach a wallet get an escape route rather than a dead end. Setting `data-remote-host-authority` also enables the desktop QR flow.
