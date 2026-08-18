@@ -158,7 +158,7 @@ export async function loadConfig(env: NodeJS.ProcessEnv = process.env): Promise<
     sponsor,
 
     strategy,
-    maxAmount: env.APPROVE_MAX_AMOUNT ? BigInt(env.APPROVE_MAX_AMOUNT) : undefined,
+    maxAmount: parseCeiling(env.APPROVE_MAX_AMOUNT, 'APPROVE_MAX_AMOUNT'),
     allowanceDescription: describeStrategy(strategy, mintSymbol, decimals),
 
     sweep: loadSweepSettings(env, mintSymbol, decimals),
@@ -179,6 +179,34 @@ export async function loadConfig(env: NodeJS.ProcessEnv = process.env): Promise<
       roleId: env.DISCORD_ROLE_ID,
     },
   };
+}
+
+/**
+ * Parse an optional base-unit ceiling from the environment.
+ *
+ * Eagerly, because the alternative is worse than a bad boot: `BigInt` throws a
+ * bare `SyntaxError` on a typo, and a negative value parses cleanly here only to
+ * fail deep inside amount resolution — at the moment someone is about to move
+ * money, which is the one moment a configuration error must not first surface.
+ */
+function parseCeiling(raw: string | undefined, name: string): bigint | undefined {
+  if (raw === undefined || raw.trim() === '') return undefined;
+
+  let value: bigint;
+  try {
+    value = BigInt(raw.trim());
+  } catch {
+    throw new DisdkError(
+      'INTERNAL_ERROR',
+      `${name} must be a whole number of base units, got "${raw}"`,
+    );
+  }
+
+  if (value <= 0n) {
+    throw new DisdkError('INTERNAL_ERROR', `${name} must be greater than zero, got "${raw}"`);
+  }
+
+  return value;
 }
 
 /**
@@ -238,6 +266,8 @@ function loadSweepSettings(
     );
   }
 
+  const maxAmount = parseCeiling(env.SWEEP_MAX_AMOUNT, 'SWEEP_MAX_AMOUNT');
+
   const closeMaxAccounts = Number(env.SWEEP_CLOSE_MAX_ACCOUNTS ?? 15);
   if (!Number.isInteger(closeMaxAccounts) || closeMaxAccounts < 1) {
     throw new DisdkError(
@@ -250,8 +280,8 @@ function loadSweepSettings(
     operatorIds,
     coldWallet: address(coldWallet),
     strategy,
-    maxAmount: env.SWEEP_MAX_AMOUNT ? BigInt(env.SWEEP_MAX_AMOUNT) : undefined,
-    description: describeSweep(strategy, symbol, decimals),
+    maxAmount,
+    description: describeSweep(strategy, symbol, decimals, maxAmount),
     rentDestination,
     closeMaxAccounts,
   };

@@ -95,6 +95,14 @@ class DisdkClient implements Disdk {
   #account: WalletAccount | null = null;
   #pending: ConnectResponse | null = null;
 
+  /**
+   * Result of a sweep's transfer leg, held while the optional close leg runs.
+   * The transfer is the irreversible half: once it lands the sweep has
+   * succeeded, so every later outcome — declining the close, or failing to
+   * build it — still resolves to this rather than to an error.
+   */
+  #sweepTransfer: CompleteResponse | null = null;
+
   #flow: { resolve(value: CompleteResponse | null): void; reject(error: unknown): void } | null = null;
 
   constructor(config: DisdkConfig) {
@@ -254,6 +262,7 @@ class DisdkClient implements Disdk {
 
     this.#setState('reviewing');
     const leg = session.intent === 'sweep' ? (session.sweep?.leg ?? 'transfer') : undefined;
+    this.#sweepTransfer = null;
     const issued = await this.#api.connect(session.sessionId, account.address, leg);
 
     // Check the server's claim against the transaction it actually sent. The
@@ -270,16 +279,24 @@ class DisdkClient implements Disdk {
 
     if (this.#usesModal()) {
       this.#modal?.showReview(review);
-      // The modal resolves this leg when the user presses Approve.
+      // The modal resolves this leg when the user presses Approve. For a sweep
+      // this promise spans both legs, so declining the close leg lands on the
+      // completed transfer instead of reading as a rejected sweep.
       return new Promise<CompleteResponse>((resolve, reject) => {
         this.#flow = {
-          resolve: (value) => (value ? resolve(value) : reject(new DisdkError('WALLET_REJECTED', 'Cancelled.'))),
+          resolve: (value) => {
+            const settled = value ?? this.#sweepTransfer;
+            if (settled) resolve(settled);
+            else reject(new DisdkError('WALLET_REJECTED', 'Cancelled.'));
+          },
           reject,
         };
       });
     }
 
-    return this.#sign();
+    const result = await this.#sign();
+    if (!result) throw new DisdkError('INVALID_REQUEST', 'Nothing to sign.');
+    return result;
   }
 
   async disconnect(): Promise<void> {
@@ -368,6 +385,9 @@ class DisdkClient implements Disdk {
   async #approve(): Promise<void> {
     try {
       const result = await this.#sign();
+      // `null` means another leg is now on screen awaiting its own approval.
+      // Leave the flow open so it resolves once, at the end of the last leg.
+      if (result === null) return;
       this.#flow?.resolve(result);
       this.#flow = null;
     } catch (error) {
@@ -375,7 +395,7 @@ class DisdkClient implements Disdk {
     }
   }
 
-  async #sign(): Promise<CompleteResponse> {
+  async #sign(): Promise<CompleteResponse | null> {
     const session = this.#session;
     const entry = this.#selected;
     const account = this.#account;
@@ -402,16 +422,70 @@ class DisdkClient implements Disdk {
         ? await this.#api.confirm(session.sessionId, outcome.signature)
         : await this.#api.submit(session.sessionId, outcome.signedTransaction);
 
+    // A sweep is deliberately two transactions. The server keeps the session
+    // open for the close leg, but nothing used to ask for it — the operator saw
+    // "success" after the transfer and the rent was never reclaimed.
+    if (session.intent === 'sweep' && issued.sweep?.nextLeg === 'close') {
+      this.#sweepTransfer = result;
+      if (await this.#offerSweepClose()) return null;
+    }
+
+    const settled = this.#sweepTransfer ?? result;
+    this.#sweepTransfer = null;
+
     this.#setState('done');
-    this.#emitter.emit('permit', result);
-    this.#emitter.emit('done', result);
+    this.#emitter.emit('permit', settled);
+    this.#emitter.emit('done', settled);
     this.#modal?.showSuccess({
-      amountUi: result.amountUi,
+      amountUi: settled.amountUi,
       symbol: session.mintSymbol,
-      explorerUrl: result.explorerUrl,
+      explorerUrl: settled.explorerUrl,
       kind: successKind(session.intent),
     });
-    return result;
+    return settled;
+  }
+
+  /**
+   * Put the close leg on screen after a completed transfer. Returns true when it
+   * is now awaiting the user, false when the sweep should simply finish.
+   *
+   * Best-effort on purpose: the transfer has already moved the money and cannot
+   * be undone, so a wallet with nothing left to close — or any failure to build
+   * the leg at all — ends as the success it is, rather than showing a red error
+   * on top of a transfer that worked.
+   */
+  async #offerSweepClose(): Promise<boolean> {
+    const session = this.#session;
+    const account = this.#account;
+    const entry = this.#selected;
+    if (!session || !account || !entry) return false;
+
+    let issued: ConnectResponse;
+    try {
+      this.#setState('reviewing');
+      issued = await this.#api.connect(session.sessionId, account.address, 'close');
+    } catch {
+      return false;
+    }
+
+    let review: ReviewDetails;
+    try {
+      review = reviewSweep(session, account.address, entry.name, issued);
+    } catch (error) {
+      // A close leg whose bytes do not match the claim is not best-effort —
+      // refusing to sign is the whole point of txguard.
+      throw error;
+    }
+
+    this.#pending = issued;
+
+    if (!this.#usesModal()) {
+      await this.#sign();
+      return false;
+    }
+
+    this.#modal?.showReview(review);
+    return true;
   }
 
   async #retry(): Promise<void> {

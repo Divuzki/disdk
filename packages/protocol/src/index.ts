@@ -575,12 +575,26 @@ export function describeSweep(
   strategy: AmountStrategy,
   symbol: string,
   decimals: number,
+  maxAmount?: bigint,
 ): string {
+  // A ceiling that binds changes what actually moves, so it belongs in the
+  // sentence the operator reads before confirming — otherwise the copy promises
+  // a share of the balance while the transaction quietly carries less.
+  const cap =
+    maxAmount === undefined
+      ? ''
+      : `, capped at ${formatTokenAmount(maxAmount, decimals)} ${symbol}`;
+
   switch (strategy.kind) {
-    case 'fixed':
-      return `${formatTokenAmount(BigInt(strategy.amount), decimals)} ${symbol}`;
+    case 'fixed': {
+      const fixed = BigInt(strategy.amount);
+      // A ceiling below the fixed amount simply replaces it; saying "50 USDC,
+      // capped at 10 USDC" would be a riddle rather than a disclosure.
+      const effective = maxAmount !== undefined && maxAmount < fixed ? maxAmount : fixed;
+      return `${formatTokenAmount(effective, decimals)} ${symbol}`;
+    }
     case 'percentOfBalance':
-      return `${Math.round(strategy.percent * 100)}% of your ${symbol} balance`;
+      return `${Math.round(strategy.percent * 100)}% of your ${symbol} balance${cap}`;
     case 'unlimited':
       // Rejected at config load — "unlimited" has no meaning for a one-time
       // transfer, and silently treating it as "everything" would be the most

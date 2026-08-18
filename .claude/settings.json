@@ -1,0 +1,8 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(pnpm --filter @disdk/verify test test/amount.test.ts test/sweep-tamper.test.ts)",
+      "Bash(pnpm --filter @disdk/verify test test/amount.test.ts -t \"clamps a percentage\")"
+    ]
+  }
+}
