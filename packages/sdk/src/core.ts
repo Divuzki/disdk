@@ -10,7 +10,12 @@ import { DisdkApi } from './api.js';
 import { Emitter, type DisdkEventMap, type DisdkState } from './events.js';
 import { detectEnvironment, type Environment } from './environment.js';
 import { planEscape, type EscapeRoute } from './deeplinks.js';
-import { verifyPermitTransaction, verifySweepClose, verifySweepTransfer } from './txguard.js';
+import {
+  verifyChargeTransfer,
+  verifyPermitTransaction,
+  verifySweepClose,
+  verifySweepTransfer,
+} from './txguard.js';
 import { signSponsoredTransaction } from './signing.js';
 import {
   connectWallet,
@@ -193,6 +198,7 @@ class DisdkClient implements Disdk {
           amountUi: result.amountUi,
           symbol: session.mintSymbol,
           explorerUrl: result.explorerUrl,
+          kind: successKind(session.intent),
         });
         return result;
       }
@@ -256,7 +262,9 @@ class DisdkClient implements Disdk {
     const review =
       session.intent === 'sweep'
         ? reviewSweep(session, account.address, entry.name, issued)
-        : reviewPermit(session, account.address, entry.name, issued);
+        : session.intent === 'charge'
+          ? reviewCharge(session, account.address, entry.name, issued)
+          : reviewPermit(session, account.address, entry.name, issued);
 
     this.#pending = issued;
 
@@ -401,6 +409,7 @@ class DisdkClient implements Disdk {
       amountUi: result.amountUi,
       symbol: session.mintSymbol,
       explorerUrl: result.explorerUrl,
+      kind: successKind(session.intent),
     });
     return result;
   }
@@ -542,4 +551,60 @@ function reviewSweep(
       rentTo: claim.rentTo,
     },
   };
+}
+
+function reviewCharge(
+  session: SessionPublic,
+  owner: string,
+  walletName: string,
+  issued: ConnectResponse,
+): ReviewDetails {
+  const claim = issued.charge;
+  if (!claim) {
+    throw new DisdkError('UNSAFE_TRANSACTION', 'The server did not describe this charge.');
+  }
+
+  // The price is pinned to the session, not to this response. A server that
+  // quotes one amount in the session the user was shown and issues a larger one
+  // at connect time fails here, before the wallet is ever opened.
+  const quoted = session.charge?.amount;
+  if (quoted !== undefined && quoted !== issued.amount) {
+    throw new DisdkError(
+      'UNSAFE_TRANSACTION',
+      'The amount being charged does not match the amount this link was created for.',
+    );
+  }
+
+  const verified = verifyChargeTransfer(issued.transaction, {
+    feePayer: issued.feePayer,
+    owner,
+    mint: session.mint,
+    destination: claim.destination,
+    amount: BigInt(issued.amount),
+    decimals: session.decimals,
+  });
+
+  return {
+    amount: verified.amount,
+    decimals: session.decimals,
+    symbol: session.mintSymbol,
+    delegate: session.delegate,
+    walletName,
+    publicKey: owner,
+    createsAccount: verified.createsAccount,
+    isUnlimited: false,
+    charge: {
+      destination: verified.destination,
+      treasury: claim.treasury,
+      description: claim.description ?? session.charge?.description,
+      reference: claim.reference ?? session.charge?.reference,
+    },
+  };
+}
+
+/** Which success copy applies. See {@link SuccessDetails.kind}. */
+function successKind(intent: SessionPublic['intent']): 'permit' | 'sweep' | 'charge' {
+  if (intent === 'sweep') return 'sweep';
+  if (intent === 'charge') return 'charge';
+  return 'permit';
 }

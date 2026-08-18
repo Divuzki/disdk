@@ -16,12 +16,14 @@ export {
   buildRevokeTransaction,
   buildSweepTransferTransaction,
   buildSweepCloseTransaction,
+  buildChargePaymentTransaction,
 } from './build.js';
 export type {
   BuiltTransaction,
   PermitConfig,
   SweepConfig,
   SweepCloseDetail,
+  ChargeSessionConfig,
 } from './build.js';
 
 export { verifySignedTransaction, verifyOnChainPermit, bytesEqual } from './verifyTx.js';

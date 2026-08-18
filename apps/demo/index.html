@@ -113,6 +113,22 @@
       </section>
 
       <section>
+        <h2>What you are about to approve</h2>
+        <!--
+          Read live from the server, not hardcoded here. This is the allowance
+          policy the server is configured with (APPROVE_STRATEGY /
+          APPROVE_PERCENT), so changing the .env and restarting changes what
+          this line says — and what the wallet is asked to sign.
+        -->
+        <div class="log" id="policy">Loading the server's policy…</div>
+        <p class="note" style="margin-top: 12px">
+          This grants a <strong>spending allowance</strong>. It moves no money by itself — it
+          authorises the configured delegate to move up to that amount later, until you revoke it.
+          The modal shows the exact figure decoded from the transaction bytes, not from this page.
+        </p>
+      </section>
+
+      <section>
         <h2>What that takes</h2>
         <pre><code>&lt;button id="connect-wallet"&gt;Connect Wallet&lt;/button&gt;
 
@@ -162,20 +178,50 @@
         const script = document.querySelector('script[data-disdk-auto]');
         const apiBase = script?.dataset.apiBase;
         const param = script?.dataset.sessionParam || 'ds';
-        if (!apiBase || new URLSearchParams(location.search).has(param)) return;
-
         const button = document.getElementById('connect-wallet');
+        const policy = document.getElementById('policy');
+        if (!apiBase) return;
+
+        const say = (text) => {
+          if (policy) policy.textContent = text;
+        };
+
         button?.setAttribute('disabled', '');
         try {
-          const res = await fetch(`${apiBase}/api/sessions/anonymous`, { method: 'POST' });
-          if (!res.ok) throw new Error((await res.json().catch(() => ({}))).message || res.statusText);
+          // Reuse the session a Discord link brought us here with; otherwise
+          // mint one. The SDK reads the id at click time, so this only has to
+          // win the race against a human.
+          let sessionId = new URLSearchParams(location.search).get(param);
 
-          const { sessionId } = await res.json();
-          const url = new URL(location.href);
-          url.searchParams.set(param, sessionId);
-          history.replaceState(null, '', url);
+          if (!sessionId) {
+            const res = await fetch(`${apiBase}/api/sessions/anonymous`, { method: 'POST' });
+            const body = await res.json().catch(() => ({}));
+            if (!res.ok) throw new Error(body.message || res.statusText);
+
+            sessionId = body.sessionId;
+            const url = new URL(location.href);
+            url.searchParams.set(param, sessionId);
+            history.replaceState(null, '', url);
+          }
+
+          const res = await fetch(`${apiBase}/api/sessions/${encodeURIComponent(sessionId)}`);
+          const session = await res.json();
+          if (!res.ok) throw new Error(session.message || res.statusText);
+
+          say(
+            `${session.allowanceDescription} — ${session.mintSymbol} on ${session.cluster}\n` +
+              `Spender (delegate): ${session.delegate}\n` +
+              `Network fee: paid for you by the sponsor`,
+          );
         } catch (error) {
-          console.warn('[demo] could not mint a session:', error.message);
+          // Surfaced on the page, not just the console: the most common cause is
+          // ALLOW_ANONYMOUS_SESSIONS being off, and a silent button gives no
+          // hint of that.
+          say(
+            `Could not load a session: ${error.message}\n\n` +
+              `Opening this page without a ?ds= link needs ALLOW_ANONYMOUS_SESSIONS=true ` +
+              `in apps/server/.env. Otherwise run /connect in Discord and follow that link.`,
+          );
         } finally {
           button?.removeAttribute('disabled');
         }

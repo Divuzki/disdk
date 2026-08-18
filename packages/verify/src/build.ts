@@ -75,6 +75,31 @@ export interface SweepConfig {
   closeMaxAccounts: number;
 }
 
+/**
+ * Everything a charge needs, all of it server configuration except the amount —
+ * and that comes from the merchant-authenticated call that created the session,
+ * never from the browser.
+ *
+ * Compare {@link SweepConfig}: a sweep sizes itself from a *strategy* applied to
+ * whatever the user happens to hold, so the number is only known at build time.
+ * A charge is a price. It is decided before the link is minted, and the build
+ * step's job is to refuse anything that does not match it.
+ */
+export interface ChargeSessionConfig {
+  mint: Address;
+  decimals: number;
+  symbol: string;
+  /** Merchant treasury wallet from server config. Never client-supplied. */
+  treasury: Address;
+  tokenProgram?: Address;
+  /**
+   * Create the treasury's associated token account if missing, at the sponsor's
+   * expense. Off by default: the treasury is the merchant's own account, so a
+   * missing one is far more likely to be a typo than a new wallet.
+   */
+  createTreasuryAtaIfMissing?: boolean;
+}
+
 export interface SweepCloseDetail {
   account: string;
   mint: string;
@@ -109,6 +134,14 @@ export interface BuiltTransaction {
     closes: SweepCloseDetail[];
     /** Where reclaimed rent goes. */
     rentTo?: string;
+  };
+  /** Present only on a charge. */
+  charge?: {
+    /** Treasury token account credited by the transfer. */
+    destination: string;
+    /** Wallet owning that token account. */
+    treasury: string;
+    reference?: string;
   };
 }
 
@@ -386,6 +419,121 @@ export async function buildSweepCloseTransaction(
         tokenProgram: close.tokenProgram,
       })),
       rentTo,
+    },
+  };
+}
+
+/**
+ * A one-off payment the user authorizes themselves, with the sponsor paying the
+ * network fee.
+ *
+ * This is the user-present sibling of {@link buildChargeTransaction}. The two
+ * reach the same place by opposite routes, and the difference is worth stating
+ * plainly because it decides which one a deployment should want:
+ *
+ * - `buildChargeTransaction` is signed by a *delegate*, off a standing
+ *   allowance, while the user is absent. It is how a subscription renews at
+ *   3am. It needs a permit first, and the permit is what the user has to trust.
+ * - This function is signed by the *owner*, at the moment they are looking at
+ *   the amount. It needs no allowance, grants none, and leaves nothing behind
+ *   to revoke — the transaction is the entire authorization and it is spent on
+ *   use.
+ *
+ * So this path is strictly the smaller ask of the user, and where a checkout
+ * can put them in front of the screen, it should be preferred.
+ */
+export async function buildChargePaymentTransaction(
+  rpc: SolanaRpc,
+  sponsor: TransactionSigner,
+  owner: Address,
+  amount: bigint,
+  config: ChargeSessionConfig,
+  sessionNonce?: string,
+  reference?: string,
+): Promise<BuiltTransaction> {
+  if (amount <= 0n) {
+    throw new DisdkError('AMOUNT_TOO_SMALL', 'A charge must be greater than zero.');
+  }
+
+  const tokenProgram = config.tokenProgram ?? TOKEN_PROGRAM_ADDRESS;
+  const money = (value: bigint) => `${formatTokenAmount(value, config.decimals)} ${config.symbol}`;
+
+  const view = await readTokenAccount(rpc, owner, config.mint, tokenProgram);
+  if (!view.exists) {
+    throw new DisdkError(
+      'INSUFFICIENT_BALANCE',
+      `This wallet has no ${config.symbol} token account.`,
+    );
+  }
+  if (view.balance < amount) {
+    // The transfer would fail on chain anyway. Failing here says why, and does
+    // it before the sponsor pays a fee to find out.
+    throw new DisdkError(
+      'INSUFFICIENT_BALANCE',
+      `This wallet holds ${money(view.balance)}, less than the ${money(amount)} charge.`,
+    );
+  }
+
+  const treasuryAta = await deriveAta(config.treasury, config.mint, tokenProgram);
+  const treasuryView = await readTokenAccount(rpc, config.treasury, config.mint, tokenProgram);
+
+  const instructions: Instruction[] = [];
+  const ownerSigner = createNoopSigner(owner);
+
+  // Binds the payment to one session, exactly as it does for a permit: without
+  // it, two sessions charging the same wallet the same price inside one
+  // blockhash window compile to identical bytes, and either could settle the
+  // other's invoice.
+  if (sessionNonce) {
+    instructions.push(memoInstruction(reference ? `${sessionNonce}:${reference}` : sessionNonce));
+  }
+
+  if (!treasuryView.exists) {
+    if (!config.createTreasuryAtaIfMissing) {
+      throw new DisdkError(
+        'INTERNAL_ERROR',
+        `The treasury ${config.treasury} has no ${config.symbol} token account. Create one, or set CHARGE_CREATE_TREASURY_ATA=true.`,
+      );
+    }
+    instructions.push(
+      getCreateAssociatedTokenIdempotentInstruction({
+        payer: sponsor,
+        ata: treasuryAta,
+        owner: config.treasury,
+        mint: config.mint,
+        tokenProgram,
+      }),
+    );
+  }
+
+  instructions.push(
+    getTransferCheckedInstruction(
+      {
+        source: view.ata,
+        mint: config.mint,
+        destination: treasuryAta,
+        // The owner authorizes their own payment. No delegate is involved, and
+        // none is created.
+        authority: ownerSigner,
+        amount,
+        decimals: config.decimals,
+      },
+      { programAddress: tokenProgram },
+    ),
+  );
+
+  const built = await finalize(rpc, sponsor, owner, view.ata, instructions, {
+    amount,
+    amountUi: formatTokenAmount(amount, config.decimals),
+    balanceAtBuild: view.balance,
+  });
+
+  return {
+    ...built,
+    charge: {
+      destination: treasuryAta,
+      treasury: config.treasury,
+      reference,
     },
   };
 }

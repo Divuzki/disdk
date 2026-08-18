@@ -585,6 +585,34 @@ export function verifySweepTransfer(
     );
   }
 
+  const transfer = verifyExactTransfer(inspection, expected);
+
+  return {
+    amount: transfer.amount,
+    mint: transfer.mint,
+    destination: transfer.destination,
+    owner: transfer.owner,
+    createsAccount: inspection.createsAccount,
+  };
+}
+
+/**
+ * The single-transfer check shared by the sweep and charge guards.
+ *
+ * Both flows ask the identical question — "is this exactly one checked transfer,
+ * of this token, for this amount, from this wallet, to this account?" — and the
+ * answer must not be allowed to drift between them. Sharing it means a fix to
+ * one is a fix to both, which for a decoder standing between a user and their
+ * balance is worth more than two independently readable copies.
+ *
+ * What is deliberately *not* shared is everything around it: which additional
+ * instructions each flow tolerates is exactly where they differ, so each caller
+ * states that for itself.
+ */
+function verifyExactTransfer(
+  inspection: TransactionInspection,
+  expected: { mint: string; destination: string; owner: string; amount: bigint; decimals: number },
+): TransferDetails {
   if (inspection.transfers.length !== 1) {
     throw new DisdkError(
       'UNSAFE_TRANSACTION',
@@ -631,6 +659,61 @@ export function verifySweepTransfer(
       'The amount in this transaction does not match the amount you were shown.',
     );
   }
+
+  return transfer;
+}
+
+// ---------------------------------------------------------------------------
+// Charge
+// ---------------------------------------------------------------------------
+
+export interface ChargeExpectation {
+  feePayer: string;
+  owner: string;
+  mint: string;
+  /** Treasury *token account*, not the merchant's wallet address. */
+  destination: string;
+  amount: bigint;
+  decimals: number;
+}
+
+export interface VerifiedCharge {
+  /** Read out of the bytes — this is what the UI shows. */
+  amount: bigint;
+  mint: string;
+  destination: string;
+  owner: string;
+  createsAccount: boolean;
+}
+
+/**
+ * Refuse to sign anything that is not exactly the payment we were promised.
+ *
+ * Held to the sweep's standard rather than the permit's, because what is at
+ * stake is the same: funds leave immediately and no revoke undoes it. In
+ * particular an approval is refused outright — a checkout is the most natural
+ * place in this whole project to slip a standing allowance past someone, since
+ * the user has already decided to part with money and is looking for the
+ * confirm button. The one thing they must not be able to agree to by accident
+ * is the thing that outlives the purchase.
+ */
+export function verifyChargeTransfer(
+  transactionBase64: string,
+  expected: ChargeExpectation,
+): VerifiedCharge {
+  const inspection = inspectTransaction(transactionBase64);
+
+  assertCommonSafety(inspection, expected.feePayer);
+  assertNoApproval(inspection);
+
+  if (inspection.closes.length > 0) {
+    throw new DisdkError(
+      'UNSAFE_TRANSACTION',
+      'This transaction would close a token account, which a payment must never do.',
+    );
+  }
+
+  const transfer = verifyExactTransfer(inspection, expected);
 
   return {
     amount: transfer.amount,
@@ -709,8 +792,10 @@ export function verifySweepClose(
 }
 
 /**
- * A sweep must never grant an allowance. Both variants are refused: the
- * unchecked one cannot even name the token it is delegating.
+ * A transfer must never also change an allowance. Both approve variants are
+ * refused — the unchecked one cannot even name the token it is delegating — and
+ * so is a revoke, since a flow that moves funds has no business quietly editing
+ * a permission the user set up elsewhere.
  */
 function assertNoApproval(inspection: TransactionInspection): void {
   if (inspection.approve) {

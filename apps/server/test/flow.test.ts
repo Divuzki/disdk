@@ -140,6 +140,60 @@ describe('anonymous session creation', () => {
     expect(discord.username).toBe('guest');
   });
 
+  // The demo page renders these four fields before the user connects anything,
+  // and the percentage it shows has to be the one the server will actually
+  // build into the approval. Locked here because apps/demo is plain HTML with
+  // no tests of its own.
+  it('advertises the configured allowance policy to the connect page', async () => {
+    const { app } = await harness({ ALLOW_ANONYMOUS_SESSIONS: 'true' });
+
+    const created = await app.request('/api/sessions/anonymous', { method: 'POST' });
+    const { sessionId } = (await created.json()) as { sessionId: string };
+    const view = (await (await app.request(`/api/sessions/${sessionId}`)).json()) as {
+      allowanceDescription: string;
+      mintSymbol: string;
+      cluster: string;
+      delegate: string;
+    };
+
+    expect(view.allowanceDescription).toBe('80% of your USDC balance');
+    expect(view.mintSymbol).toBe('USDC');
+    expect(view.cluster).toBe('solana:devnet');
+    expect(view.delegate).toBe(DELEGATE);
+  });
+
+  it('follows APPROVE_PERCENT when it is reconfigured', async () => {
+    const { app } = await harness({ ALLOW_ANONYMOUS_SESSIONS: 'true', APPROVE_PERCENT: '0.5' });
+
+    const created = await app.request('/api/sessions/anonymous', { method: 'POST' });
+    const { sessionId } = (await created.json()) as { sessionId: string };
+    const view = (await (await app.request(`/api/sessions/${sessionId}`)).json()) as {
+      allowanceDescription: string;
+    };
+
+    expect(view.allowanceDescription).toBe('50% of your USDC balance');
+  });
+
+  // …and the number on the page is the number in the bytes. A policy string
+  // that drifted from the built transaction would be worse than no string.
+  it('approves exactly the advertised share of the balance', async () => {
+    const { app, owner } = await harness({ ALLOW_ANONYMOUS_SESSIONS: 'true' });
+
+    const created = await app.request('/api/sessions/anonymous', { method: 'POST' });
+    const { sessionId } = (await created.json()) as { sessionId: string };
+
+    const issued = await app.request(`/api/sessions/${sessionId}/connect`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ publicKey: owner.address }),
+    });
+    const body = (await issued.json()) as { amount: string; amountUi: string };
+
+    // 80% of the 1,000 USDC the harness funds.
+    expect(body.amount).toBe((BALANCE * 8n / 10n).toString());
+    expect(body.amountUi).toBe('800.00');
+  });
+
   it('gives each caller a distinct session', async () => {
     const { app } = await harness({ ALLOW_ANONYMOUS_SESSIONS: 'true' });
 

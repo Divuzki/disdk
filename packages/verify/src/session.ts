@@ -1,5 +1,11 @@
 import { createHash, randomBytes, timingSafeEqual } from 'node:crypto';
-import { DisdkError, type DiscordIdentity, type SessionIntent, type SessionState } from '@disdk/protocol';
+import {
+  DisdkError,
+  type ChargeSessionRequest,
+  type DiscordIdentity,
+  type SessionIntent,
+  type SessionState,
+} from '@disdk/protocol';
 import type { BuiltTransaction } from './build.js';
 
 export interface SessionRecord {
@@ -19,6 +25,12 @@ export interface SessionRecord {
   state: SessionState;
   intent: SessionIntent;
   discord: DiscordIdentity;
+  /**
+   * The price, on a `charge` session. Stored server-side at creation and never
+   * re-read from the browser, so the amount the user is asked to pay is the one
+   * the merchant named when it minted the link.
+   */
+  charge?: ChargeSessionRequest;
   /** Discord interaction token, so the bot can edit its original reply. */
   interactionToken?: string;
   createdAt: number;
@@ -43,6 +55,7 @@ export interface SessionStore {
   create(input: {
     discord: DiscordIdentity;
     intent: SessionIntent;
+    charge?: ChargeSessionRequest;
     interactionToken?: string;
     ttlMs: number;
   }): Promise<{ sessionId: string; record: SessionRecord }>;
@@ -78,11 +91,13 @@ export class MemorySessionStore implements SessionStore {
   async create({
     discord,
     intent,
+    charge,
     interactionToken,
     ttlMs,
   }: {
     discord: DiscordIdentity;
     intent: SessionIntent;
+    charge?: ChargeSessionRequest;
     interactionToken?: string;
     ttlMs: number;
   }): Promise<{ sessionId: string; record: SessionRecord }> {
@@ -96,6 +111,7 @@ export class MemorySessionStore implements SessionStore {
       state: 'pending',
       intent,
       discord,
+      charge,
       interactionToken,
       createdAt: now,
       expiresAt: now + ttlMs,

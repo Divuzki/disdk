@@ -10,7 +10,13 @@ import {
   type RentDestination,
 } from '@disdk/protocol';
 import { address, type Address, type KeyPairSigner } from '@solana/kit';
-import { loadSponsorSigner, parseStrategy } from '@disdk/verify';
+import {
+  describeTerms,
+  loadSponsorSigner,
+  parseChargeTerms,
+  parseStrategy,
+  type ChargeTerms,
+} from '@disdk/verify';
 
 export interface ServerConfig {
   port: number;
@@ -37,7 +43,6 @@ export interface ServerConfig {
   corsOrigins: string[];
 
   /**
-  /**
    * Let the connect page mint its own session, with no Discord identity behind
    * it. Convenient for a demo or a non-Discord integration; off by default,
    * because a real deployment wants the link to prove who is asking.
@@ -50,6 +55,14 @@ export interface ServerConfig {
    * configured an operator allowlist.
    */
   sweep: SweepSettings | null;
+
+  /**
+   * User-signed checkout. `null` until a treasury is configured, because a
+   * charge with nowhere to settle is not a half-working feature — it is a
+   * request to invent a destination, which is the one thing this codebase never
+   * does with money.
+   */
+  charge: ChargeSettings | null;
 
   discord: {
     token?: string;
@@ -76,6 +89,21 @@ export interface SweepSettings {
   description: string;
   rentDestination: RentDestination;
   closeMaxAccounts: number;
+}
+
+/**
+ * Checkout settings.
+ *
+ * Deliberately reuses {@link ChargeTerms} — the same limits object the
+ * delegate-pull charge service enforces. The two services authorize charges by
+ * completely different means, but "how much may this wallet be charged, how
+ * often, and to where" is one policy question, and a deployment that answered
+ * it twice would eventually answer it two different ways.
+ */
+export interface ChargeSettings {
+  terms: ChargeTerms;
+  /** One-line summary of the terms, for the boot log. */
+  description: string;
 }
 
 const DEFAULT_RPC: Record<Cluster, string> = {
@@ -134,6 +162,7 @@ export async function loadConfig(env: NodeJS.ProcessEnv = process.env): Promise<
     allowanceDescription: describeStrategy(strategy, mintSymbol, decimals),
 
     sweep: loadSweepSettings(env, mintSymbol, decimals),
+    charge: loadChargeSettings(env, mintSymbol, decimals),
 
     sessionTtlMs: Number(env.SESSION_TTL_MS ?? 10 * 60 * 1000),
     botApiSecret,
@@ -239,6 +268,53 @@ export function isSweepOperator(
 ): boolean {
   if (!sweep || !discordUserId) return false;
   return sweep.operatorIds.has(discordUserId);
+}
+
+/**
+ * Read the checkout configuration, or `null` to leave the feature off.
+ *
+ * Off is the default. Turning it on takes a `TREASURY_ADDRESS`, and every other
+ * charge setting is then validated eagerly, so a bad limit surfaces at boot
+ * rather than at the moment a customer is waiting on a payment screen.
+ *
+ * Note what is *not* gated here. A sweep needs an operator allowlist because it
+ * moves a share of whatever the caller's wallet happens to hold, to the
+ * operator's own address — offering that to a stranger would be indefensible. A
+ * charge moves a price the merchant published, in exchange for something, and
+ * the payer signs it while looking at it. Strangers are the intended audience,
+ * so the protection it needs is a cap on what any one of them can be charged,
+ * which is what {@link ChargeTerms} is.
+ */
+function loadChargeSettings(
+  env: NodeJS.ProcessEnv,
+  symbol: string,
+  decimals: number,
+): ChargeSettings | null {
+  if (!env.TREASURY_ADDRESS) return null;
+
+  const terms = parseChargeTerms({
+    treasury: env.TREASURY_ADDRESS,
+    maxPerCharge: env.CHARGE_MAX_PER_CHARGE,
+    maxPerPeriod: env.CHARGE_MAX_PER_PERIOD,
+    maxChargesPerPeriod: env.CHARGE_MAX_PER_PERIOD_COUNT,
+    periodMs: env.CHARGE_PERIOD_MS,
+    minIntervalMs: env.CHARGE_MIN_INTERVAL_MS,
+    createTreasuryAtaIfMissing: env.CHARGE_CREATE_TREASURY_ATA,
+  });
+
+  if (terms.maxPerCharge === undefined) {
+    // Every other limit is genuinely optional; this one is the difference
+    // between "a merchant may charge up to X" and "a merchant may charge
+    // whatever it asks for". Since sessions are minted with the bot secret, an
+    // absent cap means a leaked secret can name any price, and the user's own
+    // balance becomes the only ceiling.
+    throw new DisdkError(
+      'INTERNAL_ERROR',
+      'CHARGE_MAX_PER_CHARGE is required when TREASURY_ADDRESS is set. Refusing to start a checkout with no per-charge ceiling.',
+    );
+  }
+
+  return { terms, description: describeTerms(terms, symbol, decimals) };
 }
 
 function required(env: NodeJS.ProcessEnv, key: string): string {

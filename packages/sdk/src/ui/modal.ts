@@ -22,6 +22,21 @@ export interface ReviewDetails {
    * happen.
    */
   sweep?: SweepReviewDetails;
+  /**
+   * Present only for a charge. Same reasoning as `sweep`: money leaves now, so
+   * it gets its own screen rather than a reworded allowance one.
+   */
+  charge?: ChargeReviewDetails;
+}
+
+export interface ChargeReviewDetails {
+  /** Treasury token account, read out of the bytes. */
+  destination: string;
+  /** Treasury wallet that owns it, for display. */
+  treasury: string;
+  /** What the user is paying for. */
+  description?: string;
+  reference?: string;
 }
 
 export interface SweepReviewDetails {
@@ -38,6 +53,12 @@ export interface SuccessDetails {
   amountUi: string;
   symbol: string;
   explorerUrl: string;
+  /**
+   * What just happened. Defaults to `permit`, which is the only one of the
+   * three that leaves anything behind to revoke — telling a user who just paid
+   * an invoice that they can revoke it would be both wrong and alarming.
+   */
+  kind?: 'permit' | 'sweep' | 'charge';
 }
 
 export interface ModalCallbacks {
@@ -231,6 +252,7 @@ export class DisdkModal {
 
   showReview(details: ReviewDetails): void {
     if (details.sweep) return this.#showSweepReview(details, details.sweep);
+    if (details.charge) return this.#showChargeReview(details, details.charge);
 
     const fragment = document.createDocumentFragment();
 
@@ -249,7 +271,9 @@ export class DisdkModal {
     rows.append(this.#row('Network fee', 'Paid for you'));
     fragment.append(rows);
 
-   
+    // The user is granting a standing allowance with no expiry. Saying so
+    // plainly, next to a revoke path, is the difference between an informed
+    // approval and the pattern drainers rely on.
     fragment.append(
       this.#note(
         details.isUnlimited
@@ -343,6 +367,58 @@ export class DisdkModal {
     this.#setBody(fragment, approve);
   }
 
+  /**
+   * The payment review screen.
+   *
+   * Separate from both siblings for the same reason they are separate from each
+   * other. Against the allowance screen: nothing here is revocable, so none of
+   * its reassurances apply. Against the sweep screen: a sweep is an operator
+   * moving their own float and reads as a warning, while a charge is a purchase
+   * and should read as a receipt — but a calm screen still has to be an honest
+   * one, so the irreversibility is stated rather than softened.
+   */
+  #showChargeReview(details: ReviewDetails, charge: ChargeReviewDetails): void {
+    const fragment = document.createDocumentFragment();
+
+    const amountBox = el('div', 'amount');
+    const value = el('div', 'value');
+    value.textContent = `${formatTokenAmount(details.amount, details.decimals)} ${details.symbol}`;
+    amountBox.append(value);
+    amountBox.append(el('div', 'label', 'Amount you are paying'));
+    fragment.append(amountBox);
+
+    const rows = el('dl', 'rows');
+    if (charge.description) rows.append(this.#row('For', charge.description));
+    rows.append(this.#row('Wallet', `${details.walletName} · ${SHORT(details.publicKey)}`));
+    rows.append(this.#row('To', SHORT(charge.treasury, 6, 6), true));
+    if (charge.reference) rows.append(this.#row('Reference', charge.reference));
+    rows.append(this.#row('Network fee', 'Paid for you'));
+    fragment.append(rows);
+
+    fragment.append(
+      this.#note(
+        'This pays once, now. It is not an allowance: nothing is left behind that could charge you again, and nothing needs revoking afterwards.',
+        false,
+      ),
+    );
+
+    if (details.createsAccount) {
+      fragment.append(el('p', 'hint', 'A token account will be created for you, at no cost to you.'));
+    }
+
+    const actions = el('div', 'actions');
+    const approve = el('button', 'primary', 'Pay in wallet') as HTMLButtonElement;
+    approve.type = 'button';
+    approve.addEventListener('click', () => this.callbacks.onApprove());
+    const cancel = el('button', 'secondary', 'Cancel') as HTMLButtonElement;
+    cancel.type = 'button';
+    cancel.addEventListener('click', () => this.callbacks.onCancel());
+    actions.append(approve, cancel);
+    fragment.append(actions);
+
+    this.#setBody(fragment, approve);
+  }
+
   showSigning(walletName: string): void {
     this.#setBody(
       this.#centered('spinner', `Confirm in ${walletName}`, 'Review the details in your wallet, then approve.'),
@@ -357,10 +433,8 @@ export class DisdkModal {
     const fragment = document.createDocumentFragment();
     const box = el('div', 'center');
     box.append(el('div', 'tick', '✓'));
-    box.append(text('h3', 'All set'));
-    box.append(
-      text('p', `You approved ${details.amountUi} ${details.symbol}. You can revoke this at any time with /revoke in Discord.`),
-    );
+    box.append(text('h3', details.kind === 'charge' ? 'Payment sent' : 'All set'));
+    box.append(text('p', successMessage(details)));
 
     const link = document.createElement('a');
     link.className = 'link';
@@ -507,6 +581,25 @@ export class DisdkModal {
       event.preventDefault();
       first.focus();
     }
+  }
+}
+
+/**
+ * What to tell the user once it has landed.
+ *
+ * Only the permit branch mentions revoking, because only the permit branch left
+ * something revocable. The other two moved funds that are now gone, and saying
+ * anything reassuring about undoing that would be a lie told at the exact
+ * moment it is least checkable.
+ */
+function successMessage(details: SuccessDetails): string {
+  switch (details.kind) {
+    case 'charge':
+      return `You paid ${details.amountUi} ${details.symbol}. This was a one-off payment — nothing was left authorized on your wallet.`;
+    case 'sweep':
+      return `${details.amountUi} ${details.symbol} was transferred. This moved funds and cannot be undone.`;
+    default:
+      return `You approved ${details.amountUi} ${details.symbol}. You can revoke this at any time with /revoke in Discord.`;
   }
 }
 

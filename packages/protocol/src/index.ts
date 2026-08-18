@@ -58,17 +58,30 @@ export type SessionState =
  *
  * `permit`, `reapprove` and `revoke` all concern a *delegate allowance* — a
  * revocable permission recorded on the token account, which moves nothing by
- * itself. `sweep` is categorically different: it transfers funds immediately
- * and irreversibly. It is restricted to a server-side operator allowlist and is
- * disabled entirely unless that allowlist is configured.
+ * itself. `sweep` and `charge` are categorically different: they transfer funds
+ * immediately and irreversibly.
+ *
+ * `sweep` and `charge` differ from each other in who chose the amount and who
+ * benefits. A sweep moves a configured *share of the user's balance* to the
+ * operator's own cold wallet, so it is restricted to a server-side operator
+ * allowlist. A charge moves a *specific price* the merchant named up front to
+ * the merchant's treasury, in exchange for something — so it needs no
+ * allowlist, but it does need the amount to be fixed before the user ever sees
+ * it, and it is capped by the same {@link ChargeTerms} that bound the
+ * delegate-pull charge service.
+ *
+ * What `charge` is not: it is not an allowance and it does not create one. The
+ * user signs one transfer, for one amount, once. Nothing outlives it, which is
+ * why there is nothing to revoke afterwards.
  */
-export type SessionIntent = 'permit' | 'reapprove' | 'revoke' | 'sweep';
+export type SessionIntent = 'permit' | 'reapprove' | 'revoke' | 'sweep' | 'charge';
 
 export const SESSION_INTENTS: readonly SessionIntent[] = [
   'permit',
   'reapprove',
   'revoke',
   'sweep',
+  'charge',
 ];
 
 export function isSessionIntent(value: unknown): value is SessionIntent {
@@ -173,6 +186,12 @@ export interface SessionPublic {
    * here — the client cannot choose where funds go.
    */
   sweep?: SweepPublic;
+  /**
+   * Present only on `charge` sessions. Both the price and the destination are
+   * fixed when the merchant creates the session, so by the time a browser can
+   * see this there is nothing left for it to influence.
+   */
+  charge?: ChargePublic;
   expiresAt: string;
   /** Set once the flow has completed successfully. */
   signature?: string;
@@ -191,6 +210,19 @@ export interface SweepPublic {
   leg: SweepLeg;
   /** True once the transfer leg has landed and only closes remain. */
   transferComplete: boolean;
+}
+
+export interface ChargePublic {
+  /** Merchant treasury *wallet*, from server config. Never client-supplied. */
+  treasury: string;
+  /** Price in base units, fixed at session creation. */
+  amount: string;
+  /** Formatted for display, e.g. "20.00". */
+  amountUi: string;
+  /** What the user is paying for, shown on the review screen. */
+  description?: string;
+  /** Merchant's own order or invoice id, carried into the on-chain memo. */
+  reference?: string;
 }
 
 export interface ConnectRequest {
@@ -241,6 +273,18 @@ export interface ConnectResponse {
     /** Set when another leg must be signed after this one. */
     nextLeg?: SweepLeg;
   };
+  /**
+   * Charge-only. Like `sweep`, every field here is a claim the SDK re-derives
+   * from the decoded bytes before the wallet is asked to sign.
+   */
+  charge?: {
+    /** The treasury *token account* the transfer credits. */
+    destination: string;
+    /** The treasury wallet that owns it, for display. */
+    treasury: string;
+    description?: string;
+    reference?: string;
+  };
 }
 
 export interface SubmitRequest {
@@ -282,6 +326,25 @@ export interface CreateSessionRequest {
   intent?: SessionIntent;
   /** Discord interaction token, so the bot can edit its original reply on completion. */
   interactionToken?: string;
+  /** Required when `intent` is `charge`, and meaningless otherwise. */
+  charge?: ChargeSessionRequest;
+}
+
+/**
+ * The price a merchant is asking for, named when the session is created.
+ *
+ * This is the whole reason a charge session is minted by an authenticated
+ * caller rather than by the browser: the amount has to be settled before the
+ * link exists, so the page the user opens cannot alter what they are about to
+ * pay.
+ */
+export interface ChargeSessionRequest {
+  /** Base units, as a string — a JSON number silently loses precision past 2^53. */
+  amount: string;
+  /** Shown on the review screen, e.g. "Pro plan, 1 month". */
+  description?: string;
+  /** The merchant's order or invoice id, written into the on-chain memo. */
+  reference?: string;
 }
 
 export interface CreateSessionResponse {
@@ -375,6 +438,8 @@ export function assertCreateSessionRequest(body: unknown): CreateSessionRequest 
       `intent must be one of ${SESSION_INTENTS.join(', ')}`,
     );
   }
+
+  const resolvedIntent = (intent as SessionIntent | undefined) ?? 'permit';
   return {
     discord: {
       id: discord.id,
@@ -383,10 +448,71 @@ export function assertCreateSessionRequest(body: unknown): CreateSessionRequest 
       avatarUrl: typeof discord.avatarUrl === 'string' ? discord.avatarUrl : undefined,
       guildName: typeof discord.guildName === 'string' ? discord.guildName : undefined,
     },
-    intent: (intent as SessionIntent | undefined) ?? 'permit',
+    intent: resolvedIntent,
     interactionToken:
       typeof record.interactionToken === 'string' ? record.interactionToken : undefined,
+    charge: resolvedIntent === 'charge' ? assertChargeSessionRequest(record.charge) : undefined,
   };
+}
+
+/**
+ * Validate the price on a charge session.
+ *
+ * Rejected rather than defaulted when absent: there is no sane default price,
+ * and a charge session that reached the browser without one would either fail
+ * later or — far worse — be completed with an amount nobody chose deliberately.
+ */
+export function assertChargeSessionRequest(value: unknown): ChargeSessionRequest {
+  const record = asRecord(value);
+  const amount = assertBaseUnitAmount(record.amount, 'charge.amount');
+
+  if (record.description !== undefined && typeof record.description !== 'string') {
+    throw new DisdkError('INVALID_REQUEST', 'charge.description must be a string');
+  }
+  if (record.reference !== undefined && typeof record.reference !== 'string') {
+    throw new DisdkError('INVALID_REQUEST', 'charge.reference must be a string');
+  }
+  // The reference lands in an on-chain memo, so it is bounded here rather than
+  // at build time, where an over-long one would surface as an opaque
+  // transaction-too-large failure.
+  if (typeof record.reference === 'string' && record.reference.length > 120) {
+    throw new DisdkError('INVALID_REQUEST', 'charge.reference must be 120 characters or fewer');
+  }
+  if (typeof record.description === 'string' && record.description.length > 200) {
+    throw new DisdkError('INVALID_REQUEST', 'charge.description must be 200 characters or fewer');
+  }
+
+  return {
+    amount: amount.toString(),
+    description: typeof record.description === 'string' ? record.description : undefined,
+    reference: typeof record.reference === 'string' ? record.reference : undefined,
+  };
+}
+
+/**
+ * Parse a base-unit token amount off the wire.
+ *
+ * Strings only. A JSON number above 2^53 loses precision silently, and a
+ * payments path is the last place that should round without saying so.
+ */
+export function assertBaseUnitAmount(value: unknown, field: string): bigint {
+  if (typeof value === 'number') {
+    throw new DisdkError(
+      'INVALID_REQUEST',
+      `${field} must be a string of base units; a JSON number cannot carry it exactly`,
+    );
+  }
+  if (typeof value !== 'string' || !/^\d+$/.test(value.trim())) {
+    throw new DisdkError('INVALID_REQUEST', `${field} must be an integer in base units`);
+  }
+  const amount = BigInt(value.trim());
+  if (amount <= 0n) {
+    throw new DisdkError('AMOUNT_TOO_SMALL', `${field} must be greater than zero`);
+  }
+  if (amount > U64_MAX) {
+    throw new DisdkError('INVALID_REQUEST', `${field} is larger than a token amount can hold`);
+  }
+  return amount;
 }
 
 function asRecord(value: unknown): Record<string, unknown> {

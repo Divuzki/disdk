@@ -6,6 +6,8 @@ import {
   USDC_MINTS,
   assertConfirmRequest,
   assertConnectRequest,
+  assertBaseUnitAmount,
+  assertChargeSessionRequest,
   assertCreateSessionRequest,
   assertSubmitRequest,
   describeStrategy,
@@ -14,6 +16,7 @@ import {
   isBase64,
   isCluster,
   isLikelyBase58Address,
+  isSessionIntent,
   parseTokenAmount,
 } from '../src/index.js';
 
@@ -203,5 +206,84 @@ describe('DisdkError', () => {
 
   it('defaults to not retryable', () => {
     expect(new DisdkError('INVALID_REQUEST', 'no').toBody().retryable).toBe(false);
+  });
+});
+
+describe('charge session requests', () => {
+  it('accepts a priced charge session', () => {
+    const parsed = assertCreateSessionRequest({
+      discord: { id: '1', username: 'merchant' },
+      intent: 'charge',
+      charge: { amount: '20000000', description: 'Pro plan', reference: 'order-1' },
+    });
+
+    expect(parsed.intent).toBe('charge');
+    expect(parsed.charge).toEqual({
+      amount: '20000000',
+      description: 'Pro plan',
+      reference: 'order-1',
+    });
+  });
+
+  // There is no sane default price, and a charge session that reached a browser
+  // without one would be completed for an amount nobody chose.
+  it('refuses a charge session with no amount', () => {
+    expect(() =>
+      assertCreateSessionRequest({
+        discord: { id: '1', username: 'merchant' },
+        intent: 'charge',
+      }),
+    ).toThrow(DisdkError);
+  });
+
+  it('ignores charge details on every other intent', () => {
+    const parsed = assertCreateSessionRequest({
+      discord: { id: '1', username: 'user' },
+      intent: 'permit',
+      charge: { amount: '20000000' },
+    });
+
+    expect(parsed.charge).toBeUndefined();
+  });
+
+  it('accepts charge as a session intent', () => {
+    expect(isSessionIntent('charge')).toBe(true);
+  });
+
+  it('bounds the reference and description that reach an on-chain memo', () => {
+    expect(() =>
+      assertChargeSessionRequest({ amount: '1', reference: 'x'.repeat(121) }),
+    ).toThrow(/120 characters/i);
+    expect(() =>
+      assertChargeSessionRequest({ amount: '1', description: 'x'.repeat(201) }),
+    ).toThrow(/200 characters/i);
+  });
+});
+
+describe('assertBaseUnitAmount', () => {
+  it('reads an integer string of base units', () => {
+    expect(assertBaseUnitAmount('20000000', 'amount')).toBe(20_000_000n);
+  });
+
+  // Above 2^53 a JSON number rounds, and it does so silently. Refusing the type
+  // outright is the only way a caller finds out before the money moves.
+  it('refuses a JSON number outright', () => {
+    expect(() => assertBaseUnitAmount(20000000, 'amount')).toThrow(/cannot carry it exactly/i);
+  });
+
+  it('refuses zero, negatives, and decimals', () => {
+    expect(() => assertBaseUnitAmount('0', 'amount')).toThrow(/greater than zero/i);
+    expect(() => assertBaseUnitAmount('-5', 'amount')).toThrow(/base units/i);
+    expect(() => assertBaseUnitAmount('20.5', 'amount')).toThrow(/base units/i);
+  });
+
+  it('refuses an amount larger than a u64 can hold', () => {
+    expect(() => assertBaseUnitAmount((U64_MAX + 1n).toString(), 'amount')).toThrow(
+      /larger than a token amount/i,
+    );
+  });
+
+  it('names the offending field', () => {
+    expect(() => assertBaseUnitAmount('nope', 'charge.amount')).toThrow(/charge\.amount/);
   });
 });

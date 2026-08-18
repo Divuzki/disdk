@@ -18,6 +18,8 @@ import {
 import {
   MAX_ISSUES_PER_SESSION,
   assertUsable,
+  assertWithinTerms,
+  buildChargePaymentTransaction,
   buildPermitTransaction,
   buildRevokeTransaction,
   buildSweepCloseTransaction,
@@ -82,9 +84,17 @@ export function createApi(services: Services): Hono {
       assertSweepOperator(config, input.discord.id);
     }
 
+    // Priced here, at the only point where the merchant is authenticated. Once
+    // this session exists the amount is settled: the browser never sends one,
+    // and `/connect` reads it back off the record rather than off the request.
+    if (input.intent === 'charge') {
+      assertChargePrice(config, input.charge?.amount);
+    }
+
     const { sessionId, record } = await store.create({
       discord: input.discord,
       intent: input.intent ?? 'permit',
+      charge: input.charge,
       interactionToken: input.interactionToken,
       ttlMs: config.sessionTtlMs,
     });
@@ -197,6 +207,7 @@ export function createApi(services: Services): Hono {
       owner: built.owner,
       expiresAt: built.expiresAt,
       sweep: sweepResponse(built, services),
+      charge: chargeResponse(built, record),
     };
     return c.json(response);
   });
@@ -330,13 +341,74 @@ function assertSweepOperator(config: ServerConfig, discordUserId: string): void 
   }
 }
 
-function buildForIntent(
+/**
+ * Refuse a charge session that is not priced within the configured terms.
+ *
+ * The per-charge ceiling is applied here as well as at build time, and the
+ * duplication is the point: this is the check that runs while the merchant is
+ * still on the phone, so a misconfigured integration fails at the moment it
+ * mints a bad link rather than in front of the customer it sent that link to.
+ * The build-time check is the boundary; this one is the error message.
+ */
+function assertChargePrice(config: ServerConfig, amount: string | undefined): void {
+  if (!config.charge) {
+    throw new DisdkError('UNAUTHORIZED', 'This feature is not enabled.');
+  }
+  // `assertCreateSessionRequest` guarantees this for a charge intent; restated
+  // so this function is safe to call from anywhere.
+  if (amount === undefined) {
+    throw new DisdkError('INVALID_REQUEST', 'A charge session requires charge.amount.');
+  }
+
+  const { maxPerCharge } = config.charge.terms;
+  if (maxPerCharge !== undefined && BigInt(amount) > maxPerCharge) {
+    throw new DisdkError(
+      'CHARGE_REFUSED',
+      `That charge is ${formatTokenAmount(BigInt(amount), config.decimals)} ${config.mintSymbol}, above the ${formatTokenAmount(maxPerCharge, config.decimals)} ${config.mintSymbol} per-charge limit.`,
+    );
+  }
+}
+
+async function buildForIntent(
   services: Services,
   record: SessionRecord,
   owner: ReturnType<typeof address>,
   leg: SweepLeg,
 ): Promise<BuiltTransaction> {
   const { config } = services;
+
+  if (record.intent === 'charge') {
+    if (!services.chargeConfig || !config.charge) {
+      throw new DisdkError('UNAUTHORIZED', 'This feature is not enabled.');
+    }
+    if (!record.charge) {
+      throw new DisdkError('INVALID_REQUEST', 'This link carries no amount to charge.');
+    }
+
+    const amount = BigInt(record.charge.amount);
+
+    // The real boundary. Re-read from the record rather than the request, and
+    // re-checked against the ledger rather than trusted from session creation,
+    // because the terms are per-wallet and the wallet is not known until now.
+    assertWithinTerms(
+      config.charge.terms,
+      await services.ledger.history(owner),
+      amount,
+      Date.now(),
+      config.decimals,
+      config.mintSymbol,
+    );
+
+    return buildChargePaymentTransaction(
+      services.rpc,
+      config.sponsor,
+      owner,
+      amount,
+      services.chargeConfig,
+      record.nonce,
+      record.charge.reference,
+    );
+  }
 
   if (record.intent === 'sweep') {
     // Unreachable via the API — both gates above run first — but a builder that
@@ -399,6 +471,20 @@ function sweepResponse(
   };
 }
 
+function chargeResponse(
+  built: BuiltTransaction,
+  record: SessionRecord,
+): ConnectResponse['charge'] {
+  if (!built.charge) return undefined;
+
+  return {
+    destination: built.charge.destination,
+    treasury: built.charge.treasury,
+    description: record.charge?.description,
+    reference: built.charge.reference,
+  };
+}
+
 async function complete(
   sessionId: string,
   record: SessionRecord,
@@ -432,6 +518,24 @@ async function complete(
           pending: undefined,
         },
   );
+
+  // Recorded once it has actually landed, which is the opposite of what the
+  // delegate-pull charge service does — and for a reason specific to this flow.
+  // There, the service submits, so a broadcast-but-unconfirmed charge might
+  // still settle and has to count. Here nothing reaches the network until the
+  // user signs, so recording at build time would let an abandoned checkout eat
+  // the user's own daily limit. The residual gap is two sessions completing
+  // concurrently; `maxPerCharge` still bounds each, and both required a
+  // deliberate signature.
+  if (record.intent === 'charge' && pending.charge) {
+    await services.ledger.record({
+      wallet: pending.owner,
+      amount: pending.amount,
+      at: Date.now(),
+      reference: pending.charge.reference,
+      signature,
+    });
+  }
 
   // Best-effort: the permit is already on chain, so a Discord outage must not
   // turn a successful approval into an error for the user.
@@ -484,6 +588,17 @@ function toPublic(
         }
       : undefined;
 
+  const charge: SessionPublic['charge'] =
+    record.intent === 'charge' && record.charge && config.charge
+      ? {
+          treasury: config.charge.terms.treasury,
+          amount: record.charge.amount,
+          amountUi: formatTokenAmount(BigInt(record.charge.amount), config.decimals),
+          description: record.charge.description,
+          reference: record.charge.reference,
+        }
+      : undefined;
+
   return {
     protocolVersion: 1,
     sessionId,
@@ -498,6 +613,7 @@ function toPublic(
     delegate: config.delegate,
     allowanceDescription: config.allowanceDescription,
     sweep,
+    charge,
     expiresAt: new Date(record.expiresAt).toISOString(),
     signature: record.signature,
     approvedAmount: record.approvedAmount,
@@ -512,10 +628,16 @@ function clientKey(c: { req: { header(name: string): string | undefined } }): st
   );
 }
 
-function statusFor(error: DisdkError): 400 | 401 | 404 | 409 | 410 | 429 | 500 {
+function statusFor(error: DisdkError): 400 | 401 | 402 | 404 | 409 | 410 | 429 | 500 {
   switch (error.code) {
     case 'UNAUTHORIZED':
       return 401;
+    // Matches the charge service, so a merchant integrating against both sees
+    // one status for "the terms refused this". `INSUFFICIENT_BALANCE` is
+    // deliberately left as-is: it predates charges and is reachable from the
+    // permit flow, where changing it would alter an existing contract.
+    case 'CHARGE_REFUSED':
+      return 402;
     case 'SESSION_NOT_FOUND':
       return 404;
     case 'SESSION_EXPIRED':
