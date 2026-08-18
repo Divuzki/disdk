@@ -198,8 +198,11 @@ describe('refusing unsafe transactions', () => {
     });
     const tx = await buildTx([approveIx(owner.address), transfer], sponsor);
 
+    // Still refused after `inspectTransaction` was changed to collect transfers
+    // rather than throw on them — now by a dedicated rule in the permit guard,
+    // which is why the message is more specific than the generic bucket below.
     expect(() => verifyPermitTransaction(tx, expectation)).toThrowError(
-      /unexpected token instruction/i,
+      /move tokens, which an approval must never do/i,
     );
   });
 
