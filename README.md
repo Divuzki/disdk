@@ -164,6 +164,65 @@ APPROVE_PERCENT=0.8                 # default
 
 `/connect` link a wallet · `/status` show the current allowance and its coverage · `/topup` re-approve against the current balance · `/revoke` clear the delegate.
 
+`/sweep` is operator-only and off by default — see below.
+
+---
+
+## Sweep (operator-only, off by default)
+
+Every other flow here grants a **revocable allowance**, which moves nothing by
+itself. `/sweep` is different in kind: it **transfers funds immediately**, to a
+cold wallet fixed in server config, and there is nothing to revoke afterwards.
+It then closes empty token accounts to reclaim their rent.
+
+**It is disabled unless `OPERATOR_DISCORD_IDS` is set**, and it is restricted to
+exactly the Discord user IDs listed there. That restriction is not cosmetic:
+`/connect` and `POST /api/sessions` are reachable by any Discord user in the
+server, so without a hard operator check, wiring an automatic 80% transfer into
+that flow would sweep *every other connecting user's* balance to the same cold
+wallet. The allowlist is what makes the feature mean "consolidate my own funds"
+rather than "drain whoever clicks".
+
+Three checks, only two of which are security boundaries:
+
+1. **`POST /api/sessions`** — rejects a `sweep` intent from a non-operator with
+   `401` before any session exists. Holds even against a caller who bypasses the
+   bot entirely with a valid `BOT_API_SECRET`, because the check is on
+   `discord.id` in the body, not on how the request arrived.
+2. **`POST /api/sessions/:id/connect`** — re-checked independently, so an
+   operator removed from the allowlist cannot keep using a link minted while
+   they were still on it.
+3. **The `/sweep` command handler** — UX only. It produces an honest "not
+   available to you" instead of a link that would fail later, and is trivially
+   bypassed by calling the API directly. That is exactly why 1 and 2 do not
+   depend on it.
+
+A denied sweep **fails closed** — it is refused outright, never quietly
+downgraded to a permit.
+
+**Two transactions, not one.** The transfer and the closes are signed
+separately. Solana transactions are atomic, so bundling them would mean a single
+un-closeable dust account — Token-2022 accounts can carry extensions that reject
+`CloseAccount` even at zero balance — reverts the fund transfer along with it.
+Splitting the legs costs one extra signature and makes the consolidation
+independent of any individual account's close-ability.
+
+The client guard is stricter here than for a permit: `verifySweepTransfer`
+refuses **any** approval instruction in a sweep. Hiding a fresh delegate
+allowance inside a transaction the user has already decided to accept is the
+classic drainer move — the transfer they reviewed completes, and the allowance
+they never saw outlives it.
+
+**Residual risk worth knowing.** `discord.id` is trusted because
+`BOT_API_SECRET` is assumed to be held only by the real bot. If that secret
+leaked, someone who also knew an operator's Discord ID (not secret — it is
+visible in any server they post in) could force a sweep. The ceiling is lower
+than a classic drainer, though: `COLD_WALLET_PUBKEY` is server config, not
+attacker-supplied, so the worst case is an unwanted sweep to *your own already
+configured* cold wallet, not redirection to an attacker address. Treat
+`BOT_API_SECRET` as higher-sensitivity once this is on. `/sweep` also requires a
+second explicit confirmation click in Discord before a link is generated.
+
 ---
 
 ## Security model
@@ -173,7 +232,7 @@ The sponsor's signature covers the compiled transaction message, so **a client c
 - **The client chooses nothing that matters.** Mint, delegate, fee payer and allowance policy all come from server config. The client supplies only a public key.
 - **The server verifies before broadcasting.** On the `signTransaction` path it checks the returned bytes are byte-identical to what it issued. On the `signAndSendTransaction` path — where the wallet broadcasts and the server never sees the bytes — it fetches the confirmed transaction and compares the on-chain message.
 - **Each approval is bound to one session.** Two sessions for the same wallet would otherwise compile to identical transactions, and since signatures are public on chain, anyone could replay a stranger's approval into their own session to bind that wallet to their own Discord account. A per-session nonce is written as an SPL memo to prevent this.
-- **The SDK does not trust the server's JSON.** `txguard` decodes the transaction itself and refuses to sign on a wrong delegate, mint, owner or decimals; an amount that disagrees with what was displayed; a smuggled transfer or burn; the unchecked `Approve` variant, which cannot confirm the token; any program outside a narrow allowlist; or accounts hidden behind an address lookup table. The amount in the modal comes from those bytes.
+- **The SDK does not trust the server's JSON.** `txguard` decodes the transaction itself and refuses to sign on a wrong delegate, mint, owner or decimals; an amount that disagrees with what was displayed; a smuggled transfer or burn; the unchecked `Approve` variant, which cannot confirm the token; (on a sweep) any approval at all, a redirected destination or rent destination, or a close of an account it was not shown; any program outside a narrow allowlist; or accounts hidden behind an address lookup table. The amount in the modal comes from those bytes.
 - **Sessions are bearer tokens.** 32 bytes of CSPRNG, stored SHA-256 hashed, 10-minute TTL, single completion. Bot replies are ephemeral so a link never sits in a public channel. Sessions stay re-openable within their TTL, because a wallet deeplink reloads the same URL in a different browser.
 - **Sponsor spend is bounded.** Per-session issue cap plus per-IP and per-Discord-user rate limits, because every issued transaction costs the sponsor a fee and a new token account costs rent.
 - **`approveChecked`, never `approve`,** so the mint and decimals are verified on chain.

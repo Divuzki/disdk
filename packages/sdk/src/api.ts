@@ -5,6 +5,7 @@ import {
   type DisdkErrorBody,
   type PermitStatus,
   type SessionPublic,
+  type SweepLeg,
 } from '@disdk/protocol';
 
 /** Thin client over the disdk server. All state lives server-side. */
@@ -19,9 +20,14 @@ export class DisdkApi {
     return this.#request('GET', `/api/sessions/${encodeURIComponent(sessionId)}`);
   }
 
-  connect(sessionId: string, publicKey: string): Promise<ConnectResponse> {
+  connect(
+    sessionId: string,
+    publicKey: string,
+    leg?: SweepLeg,
+  ): Promise<ConnectResponse> {
     return this.#request('POST', `/api/sessions/${encodeURIComponent(sessionId)}/connect`, {
       publicKey,
+      ...(leg ? { leg } : {}),
     });
   }
 

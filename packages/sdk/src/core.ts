@@ -10,7 +10,7 @@ import { DisdkApi } from './api.js';
 import { Emitter, type DisdkEventMap, type DisdkState } from './events.js';
 import { detectEnvironment, type Environment } from './environment.js';
 import { planEscape, type EscapeRoute } from './deeplinks.js';
-import { verifyPermitTransaction } from './txguard.js';
+import { verifyPermitTransaction, verifySweepClose, verifySweepTransfer } from './txguard.js';
 import { signSponsoredTransaction } from './signing.js';
 import {
   connectWallet,
@@ -21,7 +21,7 @@ import {
   type DiscoveredWallet,
   type WalletAccount,
 } from './wallets.js';
-import { DisdkModal, type Theme } from './ui/modal.js';
+import { DisdkModal, type ReviewDetails, type Theme } from './ui/modal.js';
 
 export interface DisdkConfig {
   /** Base URL of your disdk server, e.g. https://api.example.com */
@@ -247,33 +247,21 @@ class DisdkClient implements Disdk {
     }
 
     this.#setState('reviewing');
-    const issued = await this.#api.connect(session.sessionId, account.address);
+    const leg = session.intent === 'sweep' ? (session.sweep?.leg ?? 'transfer') : undefined;
+    const issued = await this.#api.connect(session.sessionId, account.address, leg);
 
     // Check the server's claim against the transaction it actually sent. The
     // amount shown to the user comes from these bytes, so a server that lies in
     // its JSON cannot get a larger allowance signed than the one displayed.
-    const verified = verifyPermitTransaction(issued.transaction, {
-      feePayer: issued.feePayer,
-      owner: account.address,
-      mint: session.mint,
-      delegate: session.delegate,
-      amount: BigInt(issued.amount),
-      decimals: session.decimals,
-    });
+    const review =
+      session.intent === 'sweep'
+        ? reviewSweep(session, account.address, entry.name, issued)
+        : reviewPermit(session, account.address, entry.name, issued);
 
     this.#pending = issued;
 
     if (this.#usesModal()) {
-      this.#modal?.showReview({
-        amount: verified.amount,
-        decimals: session.decimals,
-        symbol: session.mintSymbol,
-        delegate: verified.delegate,
-        walletName: entry.name,
-        publicKey: account.address,
-        createsAccount: verified.createsAccount,
-        isUnlimited: verified.amount >= U64_MAX,
-      });
+      this.#modal?.showReview(review);
       // The modal resolves this leg when the user presses Approve.
       return new Promise<CompleteResponse>((resolve, reject) => {
         this.#flow = {
@@ -455,4 +443,103 @@ class DisdkClient implements Disdk {
     this.#state = state;
     this.#emitter.emit('state', state);
   }
+}
+
+// ---------------------------------------------------------------------------
+// Review construction
+// ---------------------------------------------------------------------------
+//
+// Both of these verify the server's JSON against the transaction bytes before
+// anything reaches the screen. Whatever the server claims in `issued`, the
+// numbers and addresses the user sees are the ones actually encoded.
+
+function reviewPermit(
+  session: SessionPublic,
+  owner: string,
+  walletName: string,
+  issued: ConnectResponse,
+): ReviewDetails {
+  const verified = verifyPermitTransaction(issued.transaction, {
+    feePayer: issued.feePayer,
+    owner,
+    mint: session.mint,
+    delegate: session.delegate,
+    amount: BigInt(issued.amount),
+    decimals: session.decimals,
+  });
+
+  return {
+    amount: verified.amount,
+    decimals: session.decimals,
+    symbol: session.mintSymbol,
+    delegate: verified.delegate,
+    walletName,
+    publicKey: owner,
+    createsAccount: verified.createsAccount,
+    isUnlimited: verified.amount >= U64_MAX,
+  };
+}
+
+function reviewSweep(
+  session: SessionPublic,
+  owner: string,
+  walletName: string,
+  issued: ConnectResponse,
+): ReviewDetails {
+  const claim = issued.sweep;
+  if (!claim) {
+    throw new DisdkError('UNSAFE_TRANSACTION', 'The server did not describe this sweep.');
+  }
+
+  const base = {
+    decimals: session.decimals,
+    symbol: session.mintSymbol,
+    delegate: session.delegate,
+    walletName,
+    publicKey: owner,
+    isUnlimited: false,
+  };
+
+  if (claim.leg === 'close') {
+    const verified = verifySweepClose(issued.transaction, {
+      feePayer: issued.feePayer,
+      owner,
+      rentTo: claim.rentTo,
+      accounts: claim.accounts,
+      maxAccounts: claim.maxAccounts,
+    });
+
+    return {
+      ...base,
+      amount: 0n,
+      createsAccount: false,
+      sweep: {
+        leg: 'close',
+        destination: claim.destination,
+        closeCount: verified.accounts.length,
+        rentTo: verified.rentTo,
+      },
+    };
+  }
+
+  const verified = verifySweepTransfer(issued.transaction, {
+    feePayer: issued.feePayer,
+    owner,
+    mint: session.mint,
+    destination: claim.destination,
+    amount: BigInt(issued.amount),
+    decimals: session.decimals,
+  });
+
+  return {
+    ...base,
+    amount: verified.amount,
+    createsAccount: verified.createsAccount,
+    sweep: {
+      leg: 'transfer',
+      destination: verified.destination,
+      closeCount: 0,
+      rentTo: claim.rentTo,
+    },
+  };
 }

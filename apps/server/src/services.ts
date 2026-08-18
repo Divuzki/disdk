@@ -4,7 +4,7 @@ import {
   type SessionStore,
   type SolanaRpc,
 } from '@disdk/verify';
-import type { PermitConfig } from '@disdk/verify';
+import type { PermitConfig, SweepConfig } from '@disdk/verify';
 import { RateLimiter } from './ratelimit.ts';
 import type { ServerConfig } from './config.ts';
 
@@ -25,6 +25,8 @@ export interface Services {
   rpc: SolanaRpc;
   store: SessionStore;
   permitConfig: PermitConfig;
+  /** Null whenever the sweep feature is off, which is the default. */
+  sweepConfig: SweepConfig | null;
   limiters: {
     issue: RateLimiter;
     session: RateLimiter;
@@ -55,6 +57,18 @@ export function createServices(
       strategy: config.strategy,
       maxAmount: config.maxAmount,
     },
+    sweepConfig: config.sweep
+      ? {
+          mint: config.mint,
+          decimals: config.decimals,
+          symbol: config.mintSymbol,
+          destination: config.sweep.coldWallet,
+          strategy: config.sweep.strategy,
+          maxAmount: config.sweep.maxAmount,
+          rentDestination: config.sweep.rentDestination,
+          closeMaxAccounts: config.sweep.closeMaxAccounts,
+        }
+      : null,
     limiters: {
       // Issuing costs the sponsor money, so it is the tighter of the two.
       issue: new RateLimiter(10, 60_000),
