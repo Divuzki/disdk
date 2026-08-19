@@ -28,7 +28,12 @@ const DRY = 1_000n;
 /** Comfortably above it. */
 const FUNDED = 1_000_000_000n;
 
-async function harness(envOverrides: Record<string, string> = {}, sponsorLamports?: bigint) {
+async function harness(
+  envOverrides: Record<string, string> = {},
+  sponsorLamports?: bigint,
+  /** Leave false to exercise the leg that has to create the wallet's account. */
+  withTokenAccount = true,
+) {
   const sponsor = await generateSponsorKeypair();
   const config = await loadConfig({
     CLUSTER: 'solana:devnet',
@@ -41,7 +46,7 @@ async function harness(envOverrides: Record<string, string> = {}, sponsorLamport
 
   const mock = createMockRpc();
   const owner = await generateKeyPairSigner();
-  await mockTokenAccountFor(mock, owner.address, MINT, BALANCE);
+  if (withTokenAccount) await mockTokenAccountFor(mock, owner.address, MINT, BALANCE);
   if (sponsorLamports !== undefined) {
     mock.setLamports(config.sponsor.address, sponsorLamports);
   }
@@ -63,6 +68,23 @@ async function connect(app: Hono, owner: string) {
     headers: { 'content-type': 'application/json' },
     body: JSON.stringify({ publicKey: owner }),
   });
+}
+
+const ASSOCIATED_TOKEN_PROGRAM = 'ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL';
+
+/**
+ * The accounts a built transaction actually references, fee payer first.
+ *
+ * Read out of the compiled bytes rather than the response JSON, because the
+ * question these tests ask — is the dry sponsor still in here as a signer? — is
+ * one only the bytes can answer.
+ */
+function staticAccountsOf(transactionBase64: string): string[] {
+  const tx = getTransactionDecoder().decode(getBase64Encoder().encode(transactionBase64));
+  const message = getCompiledTransactionMessageDecoder().decode(tx.messageBytes) as {
+    staticAccounts: readonly string[];
+  };
+  return [...message.staticAccounts];
 }
 
 describe('fee payer fallback', () => {
@@ -88,6 +110,49 @@ describe('fee payer fallback', () => {
 
     expect(body.feePayerRole).toBe('owner');
     expect(body.feePayer).toBe(owner.address);
+  });
+
+  // Handing over the fee is not enough on its own. A wallet with no token
+  // account needs one created, and rent is 2,039,280 lamports against 5,000 for
+  // a signature — so a sponsor named as rent payer here is asked for four
+  // hundred times the fee it was just judged unable to cover, and it rejoins as
+  // a required signer to boot. The transaction would fail on the rent instead
+  // of the fee, which is the failure the fallback exists to prevent.
+  it('moves account rent to the wallet as well when the sponsor is dry', async () => {
+    const { app, owner, config } = await harness(
+      { FEE_PAYER_FALLBACK: 'true', APPROVE_STRATEGY: 'fixed', APPROVE_FIXED_AMOUNT: '50000000' },
+      DRY,
+      false,
+    );
+
+    const body = (await (await connect(app, owner.address)).json()) as {
+      feePayerRole: string;
+      transaction: string;
+    };
+    expect(body.feePayerRole).toBe('owner');
+
+    const accounts = staticAccountsOf(body.transaction);
+    // This transaction really is creating the account...
+    expect(accounts).toContain(ASSOCIATED_TOKEN_PROGRAM);
+    // ...at the wallet's expense, with the dry sponsor absent entirely.
+    expect(accounts[0]).toBe(owner.address);
+    expect(accounts).not.toContain(config.sponsor.address);
+  });
+
+  it('leaves account rent with the sponsor while it can afford it', async () => {
+    const { app, owner, config } = await harness(
+      { FEE_PAYER_FALLBACK: 'true', APPROVE_STRATEGY: 'fixed', APPROVE_FIXED_AMOUNT: '50000000' },
+      FUNDED,
+      false,
+    );
+
+    const { transaction } = (await (await connect(app, owner.address)).json()) as {
+      transaction: string;
+    };
+
+    const accounts = staticAccountsOf(transaction);
+    expect(accounts).toContain(ASSOCIATED_TOKEN_PROGRAM);
+    expect(accounts[0]).toBe(config.sponsor.address);
   });
 
   // The premise of this SDK is that the user needs no SOL. A deployment that
@@ -150,10 +215,12 @@ describe('priority fee', () => {
   async function programsIn(app: Hono, owner: string): Promise<string[]> {
     const body = (await (await connect(app, owner)).json()) as { transaction: string };
     const tx = getTransactionDecoder().decode(getBase64Encoder().encode(body.transaction));
-    const message = getCompiledTransactionMessageDecoder().decode(tx.messageBytes);
-    return message.instructions.map(
-      (ix) => message.staticAccounts[ix.programAddressIndex] as string,
-    );
+    // The decoder returns a legacy/v0 union; both carry these two fields.
+    const message = getCompiledTransactionMessageDecoder().decode(tx.messageBytes) as {
+      instructions: readonly { programAddressIndex: number }[];
+      staticAccounts: readonly string[];
+    };
+    return message.instructions.map((ix) => message.staticAccounts[ix.programAddressIndex] as string);
   }
 
   it('adds no ComputeBudget instruction when unconfigured', async () => {

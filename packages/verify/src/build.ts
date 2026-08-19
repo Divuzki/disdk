@@ -220,6 +220,24 @@ export async function resolveFeePayer(
   return lamports < floor ? 'owner' : 'sponsor';
 }
 
+/**
+ * Who pays the rent for an account this transaction creates.
+ *
+ * Rent has to follow the fee payer. Naming the sponsor here while the owner
+ * pays the fee drags a dry sponsor back in as a required signer, and asks it
+ * for 2,039,280 lamports — four hundred times the fee we just handed over
+ * precisely because it could not cover one. The fallback would then fail on the
+ * rent instead of the fee, which is the failure it exists to prevent, so the
+ * two decisions are made together rather than independently.
+ */
+function rentPayer(
+  sponsor: TransactionSigner,
+  owner: TransactionSigner,
+  options: BuildOptions,
+): TransactionSigner {
+  return options.feePayerRole === 'owner' ? owner : sponsor;
+}
+
 export async function buildPermitTransaction(
   rpc: SolanaRpc,
   sponsor: TransactionSigner,
@@ -256,7 +274,7 @@ export async function buildPermitTransaction(
   if (!view.exists) {
     instructions.push(
       getCreateAssociatedTokenIdempotentInstruction({
-        payer: sponsor,
+        payer: rentPayer(sponsor, ownerSigner, options),
         ata: view.ata,
         owner,
         mint: config.mint,
@@ -379,7 +397,7 @@ export async function buildSweepTransferTransaction(
   if (!destinationView.exists) {
     instructions.push(
       getCreateAssociatedTokenIdempotentInstruction({
-        payer: sponsor,
+        payer: rentPayer(sponsor, ownerSigner, options),
         ata: destinationAta,
         owner: config.destination,
         mint: config.mint,
@@ -442,7 +460,6 @@ export async function buildSweepCloseTransaction(
   const candidates = await listEmptyTokenAccounts(rpc, owner, {
     limit: config.closeMaxAccounts,
   });
-
 
   const sourceView = await readTokenAccount(rpc, owner, config.mint, tokenProgram);
   const closes = candidates.filter(
@@ -567,7 +584,7 @@ export async function buildChargePaymentTransaction(
     }
     instructions.push(
       getCreateAssociatedTokenIdempotentInstruction({
-        payer: sponsor,
+        payer: rentPayer(sponsor, ownerSigner, options),
         ata: treasuryAta,
         owner: config.treasury,
         mint: config.mint,

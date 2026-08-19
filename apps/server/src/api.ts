@@ -297,6 +297,7 @@ export function createApi(services: Services): Hono {
       address(wallet),
       { mint: config.mint, decimals: config.decimals },
       record.nonce,
+      await resolveBuildOptions(services),
     );
 
     await store.update(sessionId, {
@@ -373,17 +374,18 @@ function assertChargePrice(config: ServerConfig, amount: string | undefined): vo
   }
 }
 
-async function buildForIntent(
-  services: Services,
-  record: SessionRecord,
-  owner: ReturnType<typeof address>,
-  leg: SweepLeg,
-): Promise<BuiltTransaction> {
+/**
+ * How every transaction on this server gets built.
+ *
+ * Shared rather than inlined because the revoke endpoint builds outside
+ * {@link buildForIntent}, and the one time these were computed separately the
+ * revoke path silently kept a sponsor fee payer and no priority fee — so a user
+ * whose sponsor had run dry could be left unable to revoke.
+ */
+async function resolveBuildOptions(services: Services): Promise<BuildOptions> {
   const { config } = services;
-
-  // Asked once per build, before any branch, so every intent degrades the same
-  // way. With the fallback off this is a constant and costs no RPC call.
-  const buildOptions: BuildOptions = {
+  return {
+    // With the fallback off this short-circuits and costs no RPC call.
     feePayerRole: await resolveFeePayer(services.rpc, config.sponsor.address, {
       fallbackEnabled: config.feePayerFallback,
       minLamports: config.sponsorMinLamports,
@@ -391,6 +393,16 @@ async function buildForIntent(
     priorityFeeMicroLamports: config.priorityFeeMicroLamports,
     computeUnitLimit: config.computeUnitLimit,
   };
+}
+
+async function buildForIntent(
+  services: Services,
+  record: SessionRecord,
+  owner: ReturnType<typeof address>,
+  leg: SweepLeg,
+): Promise<BuiltTransaction> {
+  const { config } = services;
+  const buildOptions = await resolveBuildOptions(services);
 
   if (record.intent === 'charge') {
     if (!services.chargeConfig || !config.charge) {

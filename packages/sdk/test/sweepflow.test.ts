@@ -103,6 +103,10 @@ interface Scenario {
   closeIssued: number;
   /** Set when the close leg should fail to build, as it does with nothing to close. */
   closeFails?: boolean;
+  /** Transfer legs issued. More than one means funds would move twice. */
+  transferIssued?: number;
+  /** Make settling the close leg fail retryably, as a confirm timeout does. */
+  closeSettleFails?: boolean;
 }
 
 async function stubApi(sponsor: KeyPairSigner, owner: Address, scenario: Scenario) {
@@ -201,6 +205,7 @@ async function stubApi(sponsor: KeyPairSigner, owner: Address, scenario: Scenari
       }
 
       calls.push('connect:transfer');
+      scenario.transferIssued = (scenario.transferIssued ?? 0) + 1;
       return json({
         transaction: transfer,
         feePayer: sponsor.address as string,
@@ -220,6 +225,18 @@ async function stubApi(sponsor: KeyPairSigner, owner: Address, scenario: Scenari
 
     if (url.endsWith('/confirm') || url.endsWith('/submit')) {
       calls.push('settle');
+      // A confirm timeout is retryable, which is what puts "Try again" on
+      // screen — the state the retry bug was reachable from.
+      if (scenario.closeSettleFails && calls.filter((c) => c === 'settle').length > 1) {
+        return json(
+          {
+            error: 'SUBMIT_FAILED',
+            message: 'Timed out waiting for the transaction to confirm.',
+            retryable: true,
+          },
+          502,
+        );
+      }
       return json({
         signature: 'sig',
         amount: AMOUNT.toString(),
@@ -237,6 +254,10 @@ async function stubApi(sponsor: KeyPairSigner, owner: Address, scenario: Scenari
 }
 
 afterEach(() => {
+  // The modal mounts its own host on document.body and only removes it on
+  // close. A test that ends on the success screen would otherwise leave that
+  // host behind for the next test's queries to find first.
+  document.body.innerHTML = '';
   vi.unstubAllGlobals();
   vi.restoreAllMocks();
 });
@@ -316,6 +337,43 @@ describe('sweep two-leg continuation', () => {
     await vi.waitFor(() => {
       expect(calls.filter((c) => c === 'settle')).toHaveLength(2);
     });
+  });
+
+  // The transfer is irreversible. "Try again" after the CLOSE leg fails must
+  // retry the close — deriving the leg from the cached session would silently
+  // build a second transfer, because that session is frozen at 'transfer' from
+  // page load and never refreshed.
+  it('retries the close leg, not the transfer, after a close-leg failure', async () => {
+    const scenario: Scenario = { closeIssued: 0, closeSettleFails: true };
+    const { calls } = await stubApi(sponsor, owner.address, scenario);
+
+    const disdk = createDisdk({ apiBase: API_BASE, sessionId: SESSION_ID });
+    void disdk.start();
+
+    const inModal = <T extends HTMLElement>(selector: string): T | null =>
+      document.querySelector('[data-disdk-modal]')?.shadowRoot?.querySelector<T>(selector) ?? null;
+
+    await vi.waitFor(() => expect(inModal<HTMLButtonElement>('button.wallet')).not.toBeNull());
+    inModal<HTMLButtonElement>('button.wallet')?.click();
+
+    // Approve the transfer.
+    await vi.waitFor(() => expect(calls).toContain('connect:transfer'));
+    inModal<HTMLButtonElement>('button.primary')?.click();
+
+    // Approve the close leg, whose settle then times out retryably.
+    await vi.waitFor(() => expect(calls).toContain('connect:close'));
+    inModal<HTMLButtonElement>('button.primary')?.click();
+
+    // "Try again" appears only for a retryable failure.
+    await vi.waitFor(() => expect(inModal<HTMLButtonElement>('button.primary')).not.toBeNull());
+    expect(scenario.transferIssued).toBe(1);
+
+    inModal<HTMLButtonElement>('button.primary')?.click();
+    await vi.waitFor(() => expect(scenario.closeIssued).toBe(2));
+
+    // The whole point: the retry asked for another close, never another transfer.
+    expect(scenario.transferIssued).toBe(1);
+    expect(calls.filter((c) => c === 'connect:transfer')).toHaveLength(1);
   });
 
   it('finishes on the transfer when there is nothing left to close', async () => {

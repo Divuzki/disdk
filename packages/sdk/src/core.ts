@@ -431,6 +431,16 @@ class DisdkClient implements Disdk {
       if (await this.#offerSweepClose()) return null;
     }
 
+    return this.#finish(result);
+  }
+
+  /**
+   * Land the flow on success. A completed sweep transfer outranks the result
+   * passed in, so a close leg that was skipped, declined, or retried to
+   * exhaustion still reports the transfer that actually moved the money.
+   */
+  #finish(result: CompleteResponse): CompleteResponse {
+    const session = this.#session;
     const settled = this.#sweepTransfer ?? result;
     this.#sweepTransfer = null;
 
@@ -439,11 +449,20 @@ class DisdkClient implements Disdk {
     this.#emitter.emit('done', settled);
     this.#modal?.showSuccess({
       amountUi: settled.amountUi,
-      symbol: session.mintSymbol,
+      symbol: session?.mintSymbol ?? '',
       explorerUrl: settled.explorerUrl,
-      kind: successKind(session.intent),
+      kind: successKind(session?.intent ?? 'permit'),
     });
     return settled;
+  }
+
+  /** Finish a sweep on its transfer leg, when the close leg cannot proceed. */
+  #finishSweep(): void {
+    const transfer = this.#sweepTransfer;
+    if (!transfer) return;
+    const settled = this.#finish(transfer);
+    this.#flow?.resolve(settled);
+    this.#flow = null;
   }
 
   /**
@@ -491,14 +510,26 @@ class DisdkClient implements Disdk {
 
   async #retry(): Promise<void> {
     this.#pending = null;
-    if (this.#selected && this.#account) {
-      try {
-        await this.requestPermit();
-      } catch (error) {
-        this.#fail(error);
-      }
-    } else {
+
+    if (!this.#selected || !this.#account) {
       this.#showPicker();
+      return;
+    }
+
+    try {
+      // A landed transfer means the failure being retried was the *close* leg.
+      // requestPermit() would derive the leg from the cached session, which is
+      // still frozen at 'transfer' from page load — so "Try again" after a
+      // close-leg timeout would quietly build a second transfer and move funds
+      // again. Retry the leg that actually failed.
+      if (this.#sweepTransfer) {
+        if (!(await this.#offerSweepClose())) this.#finishSweep();
+        return;
+      }
+
+      await this.requestPermit();
+    } catch (error) {
+      this.#fail(error);
     }
   }
 

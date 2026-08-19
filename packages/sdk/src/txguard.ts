@@ -428,7 +428,6 @@ function assertCommonSafety(
 ): void {
   const { decoded } = inspection;
 
-
   if (decoded.usesAddressLookupTables) {
     throw new DisdkError(
       'UNSAFE_TRANSACTION',
@@ -592,7 +591,16 @@ export interface VerifiedSweepClose {
   rentTo: string;
 }
 
-
+/**
+ * Refuse to sign anything that is not exactly the transfer we were promised.
+ *
+ * A sweep moves funds irreversibly, so this is stricter than the permit guard in
+ * the one way that matters most: `assertNoApproval` refuses any approval
+ * instruction outright. Hiding a fresh delegate allowance inside a transaction
+ * the user has already decided to accept is the classic drainer move — the
+ * transfer they reviewed completes, and the allowance they never saw quietly
+ * outlives it.
+ */
 export function verifySweepTransfer(
   transactionBase64: string,
   expected: SweepTransferExpectation,

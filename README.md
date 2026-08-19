@@ -283,7 +283,7 @@ COLD_WALLET_PUBKEY=<the shared destination>
 
 Anyone not on the list is still refused, at session creation and again at connect time. Each listed person still gets the ordinary review screen — "this moves tokens out of your wallet now, and cannot be undone" — and signs their own transfer, so adding names to the list is consent per participant, not a blanket grant over their wallets.
 
-**What this is not for:** the allowlist names people, not a link. It has no way to restrict *which wallet* a listed person connects, so it only works when you trust everyone on the list to sweep their own wallet and nothing else. It is not a mechanism for collecting funds from people who are not explicitly named here — see [Security model](#security-model) for why that path is refused outright.
+**What this is not for:** the allowlist names people, not a link. It has no way to restrict *which wallet* a listed person connects, so it only works when you trust everyone on the list to sweep their own wallet and nothing else. It is not a mechanism for collecting funds from people who are not explicitly named here, and wiring an automatic transfer into `/connect` — which any Discord user can reach — is refused outright for that reason.
 
 ---
 
@@ -298,7 +298,7 @@ Android goes through Mobile Wallet Adapter, registered alongside browser extensi
 ```bash
 pnpm install
 pnpm build         # build the three packages
-pnpm test          # 330 tests
+pnpm test          # 352 tests
 pnpm typecheck
 pnpm dev           # everything under apps/
 ```
