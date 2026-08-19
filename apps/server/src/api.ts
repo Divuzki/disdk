@@ -184,6 +184,10 @@ export function createApi(services: Services): Hono {
       assertSweepAuthorized(config, record, publicKey, leg ?? 'transfer');
     }
 
+    // Settle any transaction that was broadcast but never seen to confirm,
+    // before building anything that would move the same funds again.
+    await resolvePendingSubmission(services, sessionId, record);
+
     // Issuing costs the sponsor a fee, so bound it per session and per caller.
     services.limiters.issue.check(`issue:${clientKey(c)}`);
     services.limiters.issue.check(`issue:discord:${record.discord.id}`);
@@ -239,7 +243,15 @@ export function createApi(services: Services): Hono {
     // fails loudly, and a transaction issued for another session can never be
     // submitted under this one.
     await verifySignedTransaction(signedTransaction, pending);
-    const signature = await submitAndConfirm(services.rpc, signedTransaction, pending);
+
+    // A confirmation timeout below throws on a transaction that may still be
+    // live. Recording the signature at broadcast is what lets the next request
+    // ask the chain what happened instead of assuming it failed.
+    const signature = await submitAndConfirm(services.rpc, signedTransaction, pending, {
+      onBroadcast: async (broadcast) => {
+        await store.update(sessionId, { pendingSignature: broadcast });
+      },
+    });
 
     return c.json(await complete(sessionId, record, pending, signature, services));
   });
@@ -305,6 +317,19 @@ export function createApi(services: Services): Hono {
       throw new DisdkError(
         'INVALID_REQUEST',
         'Approve the allowance first. The transfer is offered afterwards.',
+      );
+    }
+    // A completed session outlives its own window on purpose, so the success
+    // screen survives a refresh — which would leave the offer standing open for
+    // as long as the record is retained. It is checked explicitly here instead:
+    // an offer answered an hour later is not the "immediately after signing"
+    // this endpoint exists for, and a stale link should not still be able to
+    // move money. The window it is measured against is refreshed when the offer
+    // is made, so answering always gets a full one.
+    if (Date.now() > record.expiresAt) {
+      throw new DisdkError(
+        'SESSION_EXPIRED',
+        'This offer has expired. Run /connect again in Discord to start over.',
       );
     }
     if (!record.owner) {
@@ -454,6 +479,110 @@ function assertSweepAuthorized(
   if (leg === 'transfer' && record.sweepTransferSignature) {
     throw new DisdkError('SESSION_ALREADY_COMPLETE', 'This transfer has already been made.');
   }
+}
+
+/**
+ * Reconcile a transaction that was broadcast but never seen to confirm.
+ *
+ * The failure this exists for is quiet and expensive. `submitAndConfirm` gives
+ * up after a minute and throws something the client is told it may retry — but
+ * "we stopped watching" is not "it failed", and the retry goes through
+ * `/connect`, which builds a *new* transaction against a *new* blockhash. For an
+ * allowance that is harmless: approving twice sets the same absolute number.
+ * For a transfer it is a second transfer of the same funds, authorized once.
+ *
+ * So a leg that moves money does not get rebuilt on a guess. The chain is asked
+ * about the outstanding signature first, and there are exactly three answers:
+ *
+ *   landed      — the session is completed against it, and the caller is told
+ *                 the work is already done rather than being handed a rebuild.
+ *   expired     — the blockhash window has closed, so it can never land now.
+ *                 The signature is dropped and the rebuild proceeds safely.
+ *   still open  — it may yet land. Refused, retryably, because the only thing
+ *                 worse than waiting is transferring twice.
+ *
+ * Idempotent legs skip all of this: they are rebuilt freely, as they always
+ * were, and carry no outstanding signature to reconcile.
+ */
+async function resolvePendingSubmission(
+  services: Services,
+  sessionId: string,
+  record: SessionRecord,
+): Promise<void> {
+  const outstanding = record.pendingSignature;
+  const pending = record.pending;
+  if (!outstanding || !pending) return;
+
+  if (!movesFunds(pending)) {
+    // Nothing irreversible is at stake, so the stale marker is simply dropped.
+    await services.store.update(sessionId, { pendingSignature: undefined });
+    return;
+  }
+
+  const landed = await getSignatureOutcome(services.rpc, outstanding, pending);
+
+  if (landed === 'confirmed') {
+    // It worked; we just were not watching when it did. Settle the session
+    // against the transaction that is actually on chain.
+    await verifyOnChainPermit(services.rpc, outstanding, pending);
+    await complete(sessionId, record, pending, outstanding, services);
+    throw new DisdkError(
+      'SESSION_ALREADY_COMPLETE',
+      'That transaction had already gone through. Reload this page to see it.',
+    );
+  }
+
+  if (landed === 'expired') {
+    await services.store.update(sessionId, { pendingSignature: undefined });
+    return;
+  }
+
+  throw new DisdkError(
+    'SUBMIT_FAILED',
+    'A transaction from this session is still being confirmed. Wait a moment and try again — retrying now could send it twice.',
+    true,
+  );
+}
+
+/** Whether rebuilding this leg would move funds a second time. */
+function movesFunds(pending: BuiltTransaction): boolean {
+  if (pending.charge) return true;
+  return pending.sweep?.leg === 'transfer';
+}
+
+/**
+ * What became of a broadcast signature: confirmed, definitively expired, or
+ * still in flight.
+ *
+ * `searchTransactionHistory` is on deliberately. The status cache only holds
+ * recent signatures, and this is asked precisely when time has passed — a cache
+ * miss read as "never landed" is the exact wrong answer here.
+ */
+async function getSignatureOutcome(
+  rpc: Services['rpc'],
+  signature: string,
+  pending: BuiltTransaction,
+): Promise<'confirmed' | 'expired' | 'pending'> {
+  const { value } = await rpc
+    .getSignatureStatuses([signature as Parameters<typeof rpc.getSignatureStatuses>[0][number]], {
+      searchTransactionHistory: true,
+    })
+    .send();
+
+  const status = value[0];
+  if (status && !status.err) {
+    if (status.confirmationStatus === 'confirmed' || status.confirmationStatus === 'finalized') {
+      return 'confirmed';
+    }
+    return 'pending';
+  }
+
+  // A transaction that failed on chain moved nothing, so rebuilding is safe —
+  // as is one whose blockhash window has closed without it landing.
+  if (status?.err) return 'expired';
+
+  const blockHeight = await rpc.getBlockHeight({ commitment: 'confirmed' }).send();
+  return blockHeight > pending.lastValidBlockHeight ? 'expired' : 'pending';
 }
 
 /**
@@ -689,6 +818,7 @@ async function complete(
   const { config } = services;
   const amountUi = formatTokenAmount(pending.amount, config.decimals);
   const url = explorerUrl(signature, config.cluster);
+  const offer = sweepOfferFor(record, config);
 
   // A sweep's transfer leg landing is not the end of the session: the close leg
   // still has to be issued and signed against it. Marking it complete here would
@@ -704,12 +834,20 @@ async function complete(
           sweepTransferSignature: signature,
           approvedAmount: pending.amount.toString(),
           pending: undefined,
+          pendingSignature: undefined,
         }
       : {
           state: 'complete',
           signature,
           approvedAmount: pending.amount.toString(),
           pending: undefined,
+          pendingSignature: undefined,
+          // An offer with no deadline is a standing invitation, and a standing
+          // invitation to move funds is not what "offered after signing" means.
+          // It gets the same life every other link here does, measured from the
+          // moment it appeared rather than from whatever was left of the window
+          // the user spent deciding whether to approve their allowance.
+          ...(offer ? { expiresAt: Date.now() + config.sessionTtlMs } : {}),
         },
   );
 
@@ -757,7 +895,7 @@ async function complete(
     // is returned to be shown, not to be acted on — no sweep transaction exists
     // at this point, and none will until this user, on this session, says they
     // want one.
-    sweepOffer: sweepOfferFor(record, config),
+    sweepOffer: offer,
   };
 }
 

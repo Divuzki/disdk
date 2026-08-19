@@ -7,6 +7,22 @@ export interface ConfirmOptions {
   /** How long to wait for confirmation before giving up. */
   timeoutMs?: number;
   pollIntervalMs?: number;
+  /**
+   * Called with the signature the moment the transaction is broadcast, before
+   * confirmation is waited on.
+   *
+   * This exists for the failure that matters most and is easiest to miss. A
+   * confirmation timeout is *not* a failed transaction — the bytes are on the
+   * network and may still land — but it throws, and the signature would be lost
+   * inside this function along with the only way to find out. A caller that
+   * persists it here can tell "never landed" from "landed, and we stopped
+   * watching", which is the difference between safely retrying a transfer and
+   * making it twice.
+   *
+   * Awaited, so a caller that writes to a store is not racing the confirmation
+   * that follows.
+   */
+  onBroadcast?(signature: string): void | Promise<void>;
 }
 
 /**
@@ -30,12 +46,17 @@ export async function submitAndConfirm(
       })
       .send();
   } catch (error) {
+    // Nothing reached the network, so there is nothing outstanding to reconcile.
     throw new DisdkError(
       'SUBMIT_FAILED',
       `Could not broadcast the transaction: ${describe(error)}`,
       isBlockhashExpiry(error),
     );
   }
+
+  // Recorded before the wait, because everything after this point can throw on a
+  // transaction that is nonetheless live.
+  await options.onBroadcast?.(signature);
 
   await confirmSignature(rpc, signature, expected, options);
   return signature;

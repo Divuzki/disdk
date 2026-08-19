@@ -335,7 +335,7 @@ Android goes through Mobile Wallet Adapter, registered alongside browser extensi
 ```bash
 pnpm install
 pnpm build         # build the three packages
-pnpm test          # 352 tests
+pnpm test          # 409 tests
 pnpm typecheck
 pnpm dev           # everything under apps/
 ```

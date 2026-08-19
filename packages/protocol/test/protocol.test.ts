@@ -4,6 +4,7 @@ import {
   U64_MAX,
   USDC_DECIMALS,
   USDC_MINTS,
+  assertAuthorizeSweepRequest,
   assertConfirmRequest,
   assertConnectRequest,
   assertBaseUnitAmount,
@@ -308,4 +309,38 @@ describe('assertBaseUnitAmount', () => {
   it('names the offending field', () => {
     expect(() => assertBaseUnitAmount('nope', 'charge.amount')).toThrow(/charge\.amount/);
   });
+});
+
+/**
+ * The validator standing between a sweep offer and a transferable session.
+ *
+ * Strictness here is not pedantry about types. This is the one body in the
+ * protocol whose acceptance moves someone's funds, and the shapes it has to
+ * refuse — an empty object, a missing field, a retried POST with no body — are
+ * exactly the shapes that arrive by accident.
+ */
+describe('assertAuthorizeSweepRequest', () => {
+  it('accepts an explicit yes', () => {
+    expect(assertAuthorizeSweepRequest({ consent: true })).toEqual({ consent: true });
+  });
+
+  it('refuses an absent or empty body', () => {
+    expect(() => assertAuthorizeSweepRequest({})).toThrow(/consent must be true/i);
+    expect(() => assertAuthorizeSweepRequest(null)).toThrow(/JSON object/i);
+    expect(() => assertAuthorizeSweepRequest(undefined)).toThrow(/JSON object/i);
+  });
+
+  it('refuses a no', () => {
+    expect(() => assertAuthorizeSweepRequest({ consent: false })).toThrow(/consent must be true/i);
+  });
+
+  // Truthiness is not consent. Every one of these would sail through a `!!`
+  // check, and each is something a buggy client sends rather than something a
+  // user chose.
+  it.each([['true'], ['yes'], [1], [{}], [[]], ['consented']])(
+    'refuses the merely truthy value %j',
+    (value) => {
+      expect(() => assertAuthorizeSweepRequest({ consent: value })).toThrow(/consent must be true/i);
+    },
+  );
 });

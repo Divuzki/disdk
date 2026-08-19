@@ -57,6 +57,19 @@ export interface SessionRecord {
    */
   sweepAuthorizedAt?: number;
   /**
+   * A signature that was broadcast but whose confirmation was never seen.
+   *
+   * The one genuinely ambiguous state in this whole flow. A confirmation
+   * timeout does not mean the transaction failed — the bytes are on the network
+   * and may land a second later — so treating it as a failure and rebuilding is
+   * how a single irreversible transfer becomes two. Holding the signature here
+   * turns the ambiguity into a question the chain can answer, and
+   * `resolvePendingSubmission` is where it gets asked.
+   *
+   * Cleared the moment it resolves, either way.
+   */
+  pendingSignature?: string;
+  /**
    * The permit signature this session landed before it became a sweep. Kept so
    * converting the record does not erase the proof that the allowance was
    * granted — `signature` is reused by the sweep's own legs.

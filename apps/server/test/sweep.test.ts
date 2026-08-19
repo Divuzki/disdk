@@ -8,7 +8,12 @@ import {
   partiallySignTransactionWithSigners,
   type KeyPairSigner,
 } from '@solana/kit';
-import { createMockRpc, mockTokenAccountFor, type MockRpc } from '@disdk/verify/testing';
+import {
+  createMockRpc,
+  mockTokenAccountFor,
+  signatureOf,
+  type MockRpc,
+} from '@disdk/verify/testing';
 import { MemorySessionStore, deriveAta, generateSponsorKeypair } from '@disdk/verify';
 import { USDC_MINTS } from '@disdk/protocol';
 import { createApi } from '../src/api.ts';
@@ -46,6 +51,7 @@ interface Harness {
 async function harness(
   envOverrides: Record<string, string> = {},
   balance: bigint = BALANCE,
+  mockOptions: { blockHeight?: bigint } = {},
 ): Promise<Harness> {
   const sponsor = await generateSponsorKeypair();
   const config = await loadConfig({
@@ -58,7 +64,7 @@ async function harness(
     ...envOverrides,
   } as NodeJS.ProcessEnv);
 
-  const mock = createMockRpc();
+  const mock = createMockRpc(mockOptions);
   const owner = await generateKeyPairSigner();
   await mockTokenAccountFor(mock, owner.address, MINT, balance);
   await mockTokenAccountFor(mock, owner.address, OTHER_MINT, 0n);
@@ -361,12 +367,154 @@ describe('sweep authorization', () => {
     expect(await again.json()).toMatchObject({ error: 'SESSION_ALREADY_COMPLETE' });
   });
 
+  // A completed session deliberately outlives its own window so the success
+  // screen survives a refresh. The offer must not inherit that: a link found in
+  // browser history an hour later is not someone answering a question they were
+  // just asked.
+  it('refuses to authorize once the offer window has passed', async () => {
+    const { app, owner, store } = await harness();
+    const sessionId = await completePermit(app, owner);
+
+    await store.update(sessionId, { expiresAt: Date.now() - 1_000 });
+
+    const response = await authorize(app, sessionId);
+    expect(response.status).toBe(410);
+    expect(await response.json()).toMatchObject({ error: 'SESSION_EXPIRED' });
+    expect((await view(app, sessionId)).intent).toBe('permit');
+  });
+
+  // The window is measured from when the offer appeared, not from what was left
+  // of the one the user spent deciding about their allowance.
+  it('gives the offer a full window of its own', async () => {
+    const { app, owner, store } = await harness({ SESSION_TTL_MS: '600000' });
+
+    const created = await createSession(app, USER_ID, 'permit');
+    const { sessionId } = (await created.json()) as { sessionId: string };
+
+    // Almost out of time when the permit is signed.
+    await store.update(sessionId, { expiresAt: Date.now() + 1_000 });
+
+    const issued = (await (await connect(app, sessionId, owner.address)).json()) as {
+      transaction: string;
+    };
+    expect((await submit(app, sessionId, await walletSign(issued.transaction, owner))).status).toBe(
+      200,
+    );
+
+    // Answering still works, and has a fresh ten minutes to happen in.
+    expect((await authorize(app, sessionId)).status).toBe(200);
+  });
+
   it('does not let a revoke session authorize a sweep', async () => {
     const { app } = await harness();
     const created = await createSession(app, USER_ID, 'revoke');
     const { sessionId } = (await created.json()) as { sessionId: string };
 
     expect((await authorize(app, sessionId)).status).toBe(400);
+  });
+});
+
+/**
+ * The ambiguous middle of a submission: broadcast, never seen to confirm.
+ *
+ * `submitAndConfirm` gives up after a minute and throws something the client is
+ * told it may retry, and that retry goes through `/connect` — which would build
+ * a second transfer of the same funds. These drive the session into that exact
+ * state and check that it is reconciled against the chain rather than guessed
+ * at. Simulating a real timeout would test vitest's clock; this tests the
+ * decision the server makes afterwards.
+ */
+describe('unconfirmed submissions', () => {
+  /** Issue the transfer leg and leave it broadcast-but-unconfirmed. */
+  async function strandTransfer(
+    h: Harness,
+    { land }: { land: boolean },
+  ): Promise<{ sessionId: string; signature: string }> {
+    const sessionId = await authorizedSweep(h.app, h.owner);
+
+    const issued = (await (await connect(h.app, sessionId, h.owner.address)).json()) as {
+      transaction: string;
+    };
+    const signed = await walletSign(issued.transaction, h.owner);
+    const signature = signatureOf(signed);
+
+    // What a confirmation timeout leaves behind: the bytes are on the network
+    // (or not), and the server recorded the signature before it stopped
+    // watching.
+    if (land) h.mock.submitted.set(signature, signed);
+    await h.store.update(sessionId, { pendingSignature: signature });
+
+    return { sessionId, signature };
+  }
+
+  // The one that would cost real money. The transfer landed while the server
+  // was not looking, so retrying must settle it, never rebuild it.
+  it('settles a transfer that landed rather than building a second one', async () => {
+    const h = await harness();
+    const { sessionId } = await strandTransfer(h, { land: true });
+    const broadcastCount = h.mock.submitted.size;
+
+    const retry = await connect(h.app, sessionId, h.owner.address);
+
+    expect(retry.status).toBe(409);
+    expect(await retry.json()).toMatchObject({ error: 'SESSION_ALREADY_COMPLETE' });
+
+    // Nothing new reached the network.
+    expect(h.mock.submitted.size).toBe(broadcastCount);
+
+    // And the session moved on to the close leg, exactly as it would have if
+    // the confirmation had been seen the first time.
+    const session = (await view(h.app, sessionId)) as {
+      sweep: { transferComplete: boolean; leg: string };
+    };
+    expect(session.sweep.transferComplete).toBe(true);
+    expect(session.sweep.leg).toBe('close');
+  });
+
+  // Still in flight. It may yet land, so refuse — retryably, since waiting is
+  // the correct thing to do and the client should be told to.
+  it('refuses to rebuild a transfer that is still in flight', async () => {
+    const h = await harness();
+    const { sessionId } = await strandTransfer(h, { land: false });
+    // Holds the permit from completePermit; the transfer never reached it.
+    const broadcastCount = h.mock.submitted.size;
+
+    const retry = await connect(h.app, sessionId, h.owner.address);
+
+    expect(retry.status).toBe(400);
+    expect(await retry.json()).toMatchObject({ error: 'SUBMIT_FAILED', retryable: true });
+    expect(h.mock.submitted.size).toBe(broadcastCount);
+  });
+
+  // Past the blockhash window it can never land, so rebuilding is safe — and
+  // must actually happen, or a genuinely failed transfer would be stuck.
+  it('rebuilds once the blockhash window has closed without it landing', async () => {
+    const h = await harness({}, BALANCE, { blockHeight: 5_000n });
+    const { sessionId } = await strandTransfer(h, { land: false });
+
+    const retry = await connect(h.app, sessionId, h.owner.address);
+    expect(retry.status).toBe(200);
+
+    const body = (await retry.json()) as { sweep: { leg: string } };
+    expect(body.sweep.leg).toBe('transfer');
+  });
+
+  // An allowance is an absolute number, not an increment, so approving twice is
+  // the same as approving once. Blocking those retries would strand users for
+  // no gain.
+  it('lets an allowance retry through without reconciling', async () => {
+    const h = await harness();
+    const created = await createSession(h.app, USER_ID, 'permit');
+    const { sessionId } = (await created.json()) as { sessionId: string };
+
+    const issued = (await (await connect(h.app, sessionId, h.owner.address)).json()) as {
+      transaction: string;
+    };
+    await h.store.update(sessionId, {
+      pendingSignature: signatureOf(await walletSign(issued.transaction, h.owner)),
+    });
+
+    expect((await connect(h.app, sessionId, h.owner.address)).status).toBe(200);
   });
 });
 
