@@ -524,3 +524,62 @@ describe('permit status', () => {
     expect(await response.json()).toMatchObject({ delegate: DELEGATE, stale: true });
   });
 });
+
+/**
+ * The fallback, carried all the way to a submitted transaction.
+ *
+ * Every other fee-payer test stops at the issued bytes, which is exactly where
+ * this arrangement still looks fine: the interesting part is downstream, in
+ * `verifySignedTransaction`, which looks up a signature under the fee payer's
+ * address. With the sponsor paying, that address is the sponsor and its
+ * signature is already there. With the owner paying, the sponsor never signs at
+ * all — so an implementation that reached for the sponsor's slot would fail on
+ * submit, after the user had approved in their wallet, which is the worst
+ * possible place to discover it.
+ */
+describe('a dry sponsor, end to end', () => {
+  /** A small real-world balance rather than the round 1,000 above. */
+  const HELD = 1_569_780n;
+
+  it('issues, signs and submits with the wallet paying', async () => {
+    const local = await harness({ FEE_PAYER_FALLBACK: 'true' });
+    local.mock.setLamports(address(local.sponsorAddress), 0n);
+    await mockTokenAccountFor(local.mock, local.owner.address, MINT, HELD);
+
+    const sessionId = await createSession(local.app);
+    const connect = await local.app.request(`/api/sessions/${sessionId}/connect`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ publicKey: local.owner.address }),
+    });
+    expect(connect.status).toBe(200);
+
+    const issued = (await connect.json()) as {
+      transaction: string;
+      amount: string;
+      feePayer: string;
+      feePayerRole: string;
+    };
+
+    // The wallet pays, and the response says so rather than leaving the client
+    // to believe the sponsor did.
+    expect(issued.feePayerRole).toBe('owner');
+    expect(issued.feePayer).toBe(local.owner.address);
+    // 80% of what the wallet holds, unaffected by who is paying the fee.
+    expect(issued.amount).toBe('1255824');
+
+    const signed = await walletSign(issued.transaction, local.owner);
+    const submit = await local.app.request(`/api/sessions/${sessionId}/submit`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ signedTransaction: signed }),
+    });
+
+    expect(submit.status).toBe(200);
+    const result = (await submit.json()) as { signature: string };
+    expect(local.mock.submitted.has(result.signature)).toBe(true);
+
+    const after = await (await local.app.request(`/api/sessions/${sessionId}`)).json();
+    expect(after).toMatchObject({ state: 'complete', approvedAmount: '1255824' });
+  });
+});

@@ -90,6 +90,21 @@ function feeNote(role: FeePayerRole | undefined): string {
   return role === 'owner' ? 'You pay it (about 0.000005 SOL)' : 'Paid for you';
 }
 
+/**
+ * What the account-creation hint says.
+ *
+ * Rent follows the fee payer, so under the fallback this is the user's
+ * 2,039,280 lamports — four hundred times the fee row above it, and much the
+ * largest number on the screen. "At no cost to you" is true only while the
+ * sponsor is paying, and printing it in the other case would be a lie about the
+ * one figure the reader would most want to know.
+ */
+function rentNote(role: FeePayerRole | undefined): string {
+  return role === 'owner'
+    ? 'A token account will be created for you. You pay its rent, about 0.00204 SOL, which comes back to you if the account is ever closed.'
+    : 'A token account will be created for you, at no cost to you.';
+}
+
 const SHORT = (value: string, lead = 4, tail = 4) =>
   value.length <= lead + tail + 1 ? value : `${value.slice(0, lead)}…${value.slice(-tail)}`;
 
@@ -296,7 +311,7 @@ export class DisdkModal {
     );
 
     if (details.createsAccount) {
-      fragment.append(el('p', 'hint', 'A token account will be created for you, at no cost to you.'));
+      fragment.append(el('p', 'hint', rentNote(details.feePayerRole)));
     }
 
     const actions = el('div', 'actions');
@@ -415,7 +430,7 @@ export class DisdkModal {
     );
 
     if (details.createsAccount) {
-      fragment.append(el('p', 'hint', 'A token account will be created for you, at no cost to you.'));
+      fragment.append(el('p', 'hint', rentNote(details.feePayerRole)));
     }
 
     const actions = el('div', 'actions');

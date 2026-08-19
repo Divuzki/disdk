@@ -43,8 +43,10 @@ export async function verifySignedTransaction(
     );
   }
 
-  const feePayerSignature = transaction.signatures[expected.feePayer];
-  if (!feePayerSignature) {
+  // Only when the sponsor is paying. Under the fallback the fee payer *is* the
+  // owner, already covered by the check below — and naming the sponsor here
+  // would blame an account that is not in this transaction at all.
+  if (expected.feePayerRole !== 'owner' && !transaction.signatures[expected.feePayer]) {
     throw new DisdkError('TRANSACTION_MISMATCH', 'The sponsor signature is missing.');
   }
 
