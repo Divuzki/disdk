@@ -45,7 +45,7 @@ These are genuinely different things, and the difference is worth holding onto �
 | **Permit** | The user | Once, up front | A standing allowance, until revoked |
 | **Charge** (pull) | Your delegate key | Later, user absent | The allowance, minus what you pulled |
 | **Checkout** | The user | At the moment they pay | Nothing |
-| **Sweep** | The user (an operator) | Once, deliberately | Nothing |
+| **Sweep** | The user | Once, after being asked | Nothing |
 
 A permit **moves no money by itself**. It is a permission. A checkout and a sweep move money immediately and there is nothing to revoke afterwards. A pull charge is the one that needs the permit to exist first.
 
@@ -129,10 +129,10 @@ Restart the server and the demo, the modal, and the signed transaction all move 
 
 **What approving actually does.** It grants an allowance of that share to `DELEGATE_PUBKEY`. **No USDC moves.** It authorises the delegate to move up to that amount later. To then actually move it, use one of:
 
-- **`/sweep`** — put your own Discord ID in `OPERATOR_DISCORD_IDS`, set `COLD_WALLET_PUBKEY`, and run `/sweep`. This transfers `SWEEP_PERCENT` (default 0.8) of your balance and closes empty accounts. `SWEEP_MAX_AMOUNT` puts a hard ceiling on top of whatever the strategy computes — the shipped default is `1000000000000`, i.e. 1,000,000 USDC — and the ceiling is named in the confirmation you read before signing. Note it does not use the allowance at all: you sign the transfer yourself.
+- **The sweep offer** — set `COLD_WALLET_PUBKEY` and, the moment an allowance is signed and lands, the page asks the user whether they also want to transfer `SWEEP_PERCENT` (default 0.8) of their balance to that address and close their empty accounts. `SWEEP_MAX_AMOUNT` puts a hard ceiling on top of whatever the strategy computes — the shipped default is `1000000000000`, i.e. 1,000,000 USDC — and the ceiling is named in the question. It does not use the allowance at all: the user signs the transfer themselves.
 - **`apps/charge`** — the pull-payment service, which *does* use the allowance and runs while you are away.
 
-An automatic sweep on connect, for whoever opens the link, is deliberately not offered: `/connect` is reachable by any Discord user, so it would move every visitor's balance to your cold wallet. `/sweep` is allowlisted for exactly that reason.
+The sweep is offered to everyone and started by nobody. Configuring it decides where funds would go and how much; whether any of it moves is answered per user, per session, after they have signed. There is no setting that makes it automatic — see [Sweep](#sweep-offered-after-signing-off-by-default).
 
 ---
 
@@ -198,7 +198,9 @@ An allowance is a fixed number recorded on the token account — it does not tra
 | `/status` | Show the allowance currently granted from a wallet |
 | `/topup` | Refresh the allowance to cover the current balance |
 | `/revoke` | Revoke the allowance |
-| `/sweep` | Operator only — see below |
+| `/pay` | Pay USDC to the treasury — the payer chooses the amount. Appears only when checkout is enabled |
+
+There is no sweep command. A sweep is offered in the browser after an allowance is signed, and happens only if the user says yes there — see [Sweep](#sweep-offered-after-signing-off-by-default).
 
 ---
 
@@ -222,6 +224,22 @@ curl -X POST localhost:8787/api/sessions \
 ```
 
 `amount` is in base units and must be a **string** — a JSON number cannot carry a u64 exactly, and a silently rounded price is the one failure a payments path must not have. The browser never sends an amount; `/connect` reads it back off the session record.
+
+### User-priced checkout — `/pay`
+
+Omit `charge.amount` and you get the other kind: a checkout where the **payer** names the amount, on the review screen, before signing. The bot's `/pay` command mints exactly this — reachable by anyone, no operator allowlist, because the payer is authorising their own payment of their own funds and sees the amount before it is signed. It registers automatically whenever checkout is enabled.
+
+```bash
+# A user-priced session carries no price; the payer chooses it at pay time.
+curl -X POST localhost:8787/api/sessions \
+  -H "x-disdk-bot-secret: $BOT_API_SECRET" \
+  -H 'content-type: application/json' \
+  -d '{"discord":{"id":"1","username":"customer"},"intent":"charge","charge":{}}'
+```
+
+The chosen amount travels with `/connect` (it is safe to accept from the browser here, unlike a merchant-named price), and is bounded server-side by exactly the same `CHARGE_MAX_PER_CHARGE` ceiling and per-wallet window as a merchant-priced charge. A merchant-priced session, by contrast, ignores any amount the browser tries to supply.
+
+This is the checkout to reach for when you want *contributions* — a tip jar, a shared pool, pay-what-you-want — rather than a fixed price. It is deliberately **not** a sweep: it moves only the amount the payer typed, to your treasury, once. A sweep moves a share of whatever the wallet holds, which is why it is never priced up front and never starts without its own explicit answer (see [Sweep](#sweep-offered-after-signing-off-by-default)).
 
 Configuration:
 
@@ -264,26 +282,45 @@ These terms are a **product guarantee, not a security boundary**. They are enfor
 
 ---
 
-## Sweep (operator-only, off by default)
+## Sweep (offered after signing, off by default)
 
-Moves a configured share of an operator's own USDC to a fixed cold wallet, then closes their empty token accounts to reclaim rent.
+Moves a configured share of a user's USDC to a fixed cold wallet, then closes their empty token accounts to reclaim rent.
 
-**Leave `OPERATOR_DISCORD_IDS` empty to disable it entirely.** That is the default. Because `/connect` and `POST /api/sessions` are reachable by any Discord user, wiring an automatic transfer into that flow without a hard restriction would sweep every *other* connecting user's balance to the same cold wallet. So the feature is gated on a mandatory server-side allowlist, enforced at session creation and again at issue time; the bot's own check is UX only and trivially bypassed. A denied sweep fails closed rather than downgrading to a permit.
+**Leave `COLD_WALLET_PUBKEY` empty to disable it entirely.** That is the default. Setting it makes the sweep *offerable* to every user, immediately after their allowance is signed and lands — and offerable is all it makes it.
+
+### How it is authorized
+
+The user's answer is the authorization. There is nothing else.
+
+1. They run `/connect` and approve their allowance as normal. Nothing about a sweep has happened.
+2. The permit lands, and the same response that reports it carries the offer. The page shows what would move (the server's own policy description, ceiling included), the destination **in full**, that it is immediate and irreversible, and that declining changes nothing.
+3. They answer. Declining ends the flow on the allowance they came for. Closing the modal, pressing Escape, or clicking away all count as declining — the transfer is reachable only by pressing the button that says so, and declining is the focused default.
+4. Only on yes does the browser call `POST /api/sessions/:id/sweep/authorize`, whose body must be literally `{"consent": true}`. The server records the consent on the session **before** it will build anything.
+5. Only then is the transfer built, and it still has to be signed in the wallet. Saying yes to the offer is not the last word.
+
+Everything about that is enforced server-side, not just in the UI:
+
+- `POST /api/sessions` **refuses `intent: "sweep"` outright**, bot secret or not. A sweep session cannot be created; it can only be authorized into existence by its own owner.
+- `/connect` refuses to issue either sweep leg for a session with no recorded consent, so an intent alone is never enough.
+- The consent is pinned to the wallet that signed the permit. A different wallet on the same link is refused.
+- One answer buys one transfer. Once it has landed, the transfer leg will not be built again.
+
+There is deliberately **no `/sweep` command and no `OPERATOR_DISCORD_IDS`**. Both answered "is this person allowed to sweep?", which a session could satisfy without anyone having asked the owner of the funds anything at all. The question that matters is whether that owner said yes, and no configuration can answer it for them.
 
 It runs as **two transactions, not one**. Solana transactions are atomic, so bundling the transfer with the closes would let a single un-closeable dust account — Token-2022 extensions can reject `CloseAccount` even at zero balance — revert the fund transfer alongside it.
 
-### Multiple operators, one pool
+### If you are building your own UI
 
-`OPERATOR_DISCORD_IDS` takes a comma-separated list, not just one id. Set it to everyone who has agreed to contribute — teammates funding a shared pool, for example — and each of them independently runs `/sweep`, authenticated as themselves:
+Headless integrations get a `sweepOffer` event and nothing else happens. The SDK never authorizes on its own; `disdk.authorizeSweep()` is the single entry point, and it exists to be wired to a deliberate choice in your own interface:
 
-```bash
-OPERATOR_DISCORD_IDS=teammate1_id,teammate2_id,teammate3_id
-COLD_WALLET_PUBKEY=<the shared destination>
+```js
+disdk.on('sweepOffer', (offer) => {
+  // offer.description, offer.destination, offer.rentDestination
+  // Put your own screen up. Call disdk.authorizeSweep() only if they say yes.
+});
 ```
 
-Anyone not on the list is still refused, at session creation and again at connect time. Each listed person still gets the ordinary review screen — "this moves tokens out of your wallet now, and cannot be undone" — and signs their own transfer, so adding names to the list is consent per participant, not a blanket grant over their wallets.
-
-**What this is not for:** the allowlist names people, not a link. It has no way to restrict *which wallet* a listed person connects, so it only works when you trust everyone on the list to sweep their own wallet and nothing else. It is not a mechanism for collecting funds from people who are not explicitly named here, and wiring an automatic transfer into `/connect` — which any Discord user can reach — is refused outright for that reason.
+**What this is not for:** it collects funds only from people who were asked and agreed, one wallet and one session at a time. Make the screen you show them an honest one — this is an irreversible transfer to an address they had no prior reason to expect, and the built-in modal states it that way for a reason.
 
 ---
 

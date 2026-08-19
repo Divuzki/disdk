@@ -154,7 +154,31 @@ header .sub { font-size: 12px; color: var(--disdk-muted); margin: 2px 0 0; }
   border-radius: var(--disdk-radius-sm); margin-bottom: 14px;
 }
 .amount .value { font-size: 30px; font-weight: 680; letter-spacing: -0.02em; }
+/*
+ * The sweep offer names its size as the server's own phrase — "80% of your USDC
+ * balance" — rather than a figure, because nothing has been built at that point
+ * and inventing a number would be worse than naming the rule. A sentence set at
+ * the figure's 30px reads as a headline and wraps to three lines, so it gets its
+ * own size while keeping the box every other amount shares.
+ */
+.amount .value.phrase { font-size: 18px; font-weight: 640; line-height: 1.4; letter-spacing: 0; }
 .amount .label { font-size: 12px; color: var(--disdk-muted); margin-top: 4px; }
+
+.amount-input {
+  display: flex; align-items: baseline; justify-content: center; gap: 8px;
+}
+.amount-input input {
+  width: 6ch; min-width: 3ch; max-width: 60%;
+  background: transparent; border: 0; border-bottom: 2px solid var(--disdk-border);
+  color: var(--disdk-text); font: inherit; font-size: 30px; font-weight: 680;
+  letter-spacing: -0.02em; text-align: right; padding: 0 2px;
+  font-variant-numeric: tabular-nums; -moz-appearance: textfield;
+}
+.amount-input input:focus { outline: none; border-bottom-color: var(--disdk-accent); }
+.amount-input input::-webkit-outer-spin-button,
+.amount-input input::-webkit-inner-spin-button { -webkit-appearance: none; margin: 0; }
+.amount-input .sym { font-size: 15px; font-weight: 600; color: var(--disdk-muted); }
+.amount-error { color: var(--disdk-danger); font-size: 12.5px; text-align: center; margin: 10px 0 0; min-height: 1em; }
 
 .rows { display: flex; flex-direction: column; gap: 1px; background: var(--disdk-border);
   border: 1px solid var(--disdk-border); border-radius: var(--disdk-radius-sm); overflow: hidden; }
@@ -189,6 +213,8 @@ button.primary:focus-visible, button.secondary:focus-visible {
 }
 
 .center { text-align: center; padding: 26px 8px; }
+/* A result stacked above a question, rather than a screen of its own. */
+.center.compact { padding: 2px 8px 18px; }
 .spinner {
   width: 30px; height: 30px; margin: 0 auto 14px;
   border: 3px solid var(--disdk-border); border-top-color: var(--disdk-accent);

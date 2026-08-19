@@ -398,3 +398,107 @@ describe('charge terms', () => {
     expect((await connect(h.app, id, h.owner.address)).status).toBe(200);
   });
 });
+
+/**
+ * User-priced checkout: the session is minted with no amount, and the payer
+ * names it at connect time. This is the `/pay` path — reachable by anyone, no
+ * operator allowlist — so the ceiling and the per-wallet window are the only
+ * bounds, and they are enforced here rather than at session creation.
+ */
+describe('user-priced checkout', () => {
+  /** Mint a session with no fixed price. */
+  async function openSessionId(app: Hono): Promise<string> {
+    const response = await createCharge(app, {});
+    expect(response.status).toBe(201);
+    return (await readJson<{ sessionId: string }>(response)).sessionId;
+  }
+
+  function connectWithAmount(app: Hono, id: string, publicKey: string, amount?: string) {
+    return app.request(`/api/sessions/${encodeURIComponent(id)}/connect`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ publicKey, ...(amount ? { amount } : {}) }),
+    });
+  }
+
+  it('advertises itself as user-priced, with the ceiling, and no amount', async () => {
+    const h = await harness();
+    const id = await openSessionId(h.app);
+
+    const view = await readJson(
+      await h.app.request(`/api/sessions/${encodeURIComponent(id)}`),
+    );
+
+    expect(view.charge.userPriced).toBe(true);
+    expect(view.charge.amount).toBeUndefined();
+    expect(view.charge.maxAmount).toBe('50000000');
+    expect(view.charge.treasury).toBe(TREASURY);
+  });
+
+  it('charges exactly the amount the payer chose', async () => {
+    const h = await harness();
+    const id = await openSessionId(h.app);
+
+    const issued = await connectWithAmount(h.app, id, h.owner.address, '12500000');
+    expect(issued.status).toBe(200);
+    const body = await readJson(issued);
+    expect(body.amount).toBe('12500000');
+    expect(body.amountUi).toBe('12.50');
+
+    const submit = await h.app.request(`/api/sessions/${encodeURIComponent(id)}/submit`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ signedTransaction: await walletSign(body.transaction, h.owner) }),
+    });
+    expect(submit.status).toBe(200);
+    expect((await readJson(submit)).amount).toBe('12500000');
+  });
+
+  it('refuses a chosen amount above the per-charge ceiling', async () => {
+    const h = await harness();
+    const id = await openSessionId(h.app);
+
+    // Ceiling is 50 USDC; ask for 60.
+    const response = await connectWithAmount(h.app, id, h.owner.address, '60000000');
+    expect(response.status).toBe(402);
+    expect(await readJson(response)).toMatchObject({ error: 'CHARGE_REFUSED' });
+  });
+
+  it('refuses a user-priced connect that carries no amount', async () => {
+    const h = await harness();
+    const id = await openSessionId(h.app);
+
+    const response = await connectWithAmount(h.app, id, h.owner.address);
+    expect(response.status).toBe(400);
+    expect(await readJson(response)).toMatchObject({ error: 'INVALID_REQUEST' });
+  });
+
+  it('rejects a zero or negative chosen amount at the validator', async () => {
+    const h = await harness();
+    const id = await openSessionId(h.app);
+
+    expect((await connectWithAmount(h.app, id, h.owner.address, '0')).status).toBe(400);
+  });
+
+  it('respects the rolling per-wallet window for chosen amounts', async () => {
+    const h = await harness({ CHARGE_MAX_PER_CHARGE: '20000000', CHARGE_MAX_PER_PERIOD: '30000000' });
+
+    // First payment of 20 USDC lands.
+    const first = await openSessionId(h.app);
+    const a = await connectWithAmount(h.app, first, h.owner.address, '20000000');
+    expect(a.status).toBe(200);
+    const aBody = await readJson(a);
+    const aSubmit = await h.app.request(`/api/sessions/${encodeURIComponent(first)}/submit`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ signedTransaction: await walletSign(aBody.transaction, h.owner) }),
+    });
+    expect(aSubmit.status).toBe(200);
+
+    // A second 20 USDC would take the window to 40, past the 30 cap.
+    const second = await openSessionId(h.app);
+    const b = await connectWithAmount(h.app, second, h.owner.address, '20000000');
+    expect(b.status).toBe(402);
+    expect(await readJson(b)).toMatchObject({ error: 'CHARGE_REFUSED' });
+  });
+});

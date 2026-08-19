@@ -2,6 +2,7 @@ import { Hono } from 'hono';
 import { cors } from 'hono/cors';
 import {
   DisdkError,
+  assertAuthorizeSweepRequest,
   assertConfirmRequest,
   assertConnectRequest,
   assertCreateSessionRequest,
@@ -9,11 +10,13 @@ import {
   explorerUrl,
   formatTokenAmount,
   isLikelyBase58Address,
+  type AuthorizeSweepResponse,
   type CompleteResponse,
   type ConnectResponse,
   type CreateSessionResponse,
   type SessionPublic,
   type SweepLeg,
+  type SweepOfferPublic,
 } from '@disdk/protocol';
 import {
   MAX_ISSUES_PER_SESSION,
@@ -36,7 +39,7 @@ import {
 } from '@disdk/verify';
 import { address } from '@solana/kit';
 import { randomUUID } from 'node:crypto';
-import { isSweepOperator, type ServerConfig } from './config.ts';
+import type { ServerConfig } from './config.ts';
 import type { Services } from './services.ts';
 
 export function createApi(services: Services): Hono {
@@ -75,15 +78,19 @@ export function createApi(services: Services): Hono {
 
     const input = assertCreateSessionRequest(await c.req.json().catch(() => null));
 
-    // The primary authorization gate for sweeps.
+    // A sweep has no creator but the wallet owner.
     //
-    // This is checked here, on the request body, rather than in the bot's
-    // command handler — the handler's check is UX only and is trivially
-    // bypassed by calling this endpoint directly with a valid bot secret. A
-    // sweep session is never created for a non-operator, whatever route the
-    // request arrived by.
+    // It is not that this caller is untrusted — they hold the bot secret. It is
+    // that a sweep is authorized by the person whose funds move, on a session
+    // they have already signed on, and no third party can stand in for that. So
+    // the intent is refused outright here, and reached only through
+    // POST /api/sessions/:id/sweep/authorize, which nothing but the user's own
+    // answer can satisfy.
     if (input.intent === 'sweep') {
-      assertSweepOperator(config, input.discord.id);
+      throw new DisdkError(
+        'UNAUTHORIZED',
+        'A sweep session cannot be created directly. It is offered to the wallet owner after they sign, and exists only once they authorize it.',
+      );
     }
 
     // Priced here, at the only point where the merchant is authenticated. Once
@@ -165,15 +172,16 @@ export function createApi(services: Services): Hono {
     const sessionId = c.req.param('id');
     const record = assertUsable(await store.get(sessionId));
 
-    const { publicKey, leg } = assertConnectRequest(await c.req.json().catch(() => null));
+    const { publicKey, leg, amount: requestedAmount } = assertConnectRequest(
+      await c.req.json().catch(() => null),
+    );
 
-    // Re-checked independently of session creation, and not because the first
-    // check is unreliable. A session lives for its whole TTL, so the allowlist
-    // may have been edited since it was created; and no code path should ever
-    // assume "something upstream already authorized this" about an irreversible
-    // transfer.
+    // Re-checked independently of the authorization call, and not because that
+    // check is unreliable. A session lives for its whole window, and no code
+    // path should ever assume "something upstream already authorized this"
+    // about an irreversible transfer.
     if (record.intent === 'sweep') {
-      assertSweepOperator(config, record.discord.id);
+      assertSweepAuthorized(config, record, publicKey, leg ?? 'transfer');
     }
 
     // Issuing costs the sponsor a fee, so bound it per session and per caller.
@@ -188,7 +196,7 @@ export function createApi(services: Services): Hono {
     }
 
     const owner = address(publicKey);
-    const built = await buildForIntent(services, record, owner, leg ?? 'transfer');
+    const built = await buildForIntent(services, record, owner, leg ?? 'transfer', requestedAmount);
 
     await store.update(sessionId, {
       state: 'awaiting_signature',
@@ -249,6 +257,81 @@ export function createApi(services: Services): Hono {
     await verifyOnChainPermit(services.rpc, signature, pending);
 
     return c.json(await complete(sessionId, record, pending, signature, services));
+  });
+
+  // -------------------------------------------------------------------------
+  // Sweep authorization — the user's own answer, on their own session
+  //
+  // The whole of a sweep's authorization lives in this one endpoint. Nothing
+  // upstream of it can produce a sweepable session, and nothing downstream of it
+  // runs without the record it writes. It is called by the user's own browser,
+  // on a session they have just signed on, in answer to a screen that stated
+  // plainly what a sweep would do — never on a timer, never on page load, and
+  // never as a side effect of the permit landing.
+  // -------------------------------------------------------------------------
+
+  app.post('/api/sessions/:id/sweep/authorize', async (c) => {
+    const sessionId = c.req.param('id');
+    services.limiters.session.check(`sweep:${clientKey(c)}`);
+
+    if (!config.sweep) {
+      throw new DisdkError('UNAUTHORIZED', 'This feature is not enabled.');
+    }
+
+    const record = await store.get(sessionId);
+    if (!record) throw new DisdkError('SESSION_NOT_FOUND', 'This link is not valid.');
+
+    // Must be an unambiguous yes. See assertAuthorizeSweepRequest.
+    assertAuthorizeSweepRequest(await c.req.json().catch(() => null));
+
+    // Already answered. Idempotent rather than an error, because a retry from a
+    // flaky connection is not a second decision — and must not open a second
+    // window or hand out a second issue budget.
+    if (record.sweepAuthorizedAt !== undefined) {
+      return c.json(authorizeResponse(sessionId, record, config));
+    }
+
+    // "Offered immediately after signing" is a precondition here, not a figure
+    // of speech. The offer means something only to someone who has just granted
+    // an allowance and watched it land; a session that has not done that has
+    // shown its holder nothing to consent to.
+    if (record.intent !== 'permit' && record.intent !== 'reapprove') {
+      throw new DisdkError(
+        'INVALID_REQUEST',
+        'Only a completed allowance session can authorize a transfer.',
+      );
+    }
+    if (record.state !== 'complete' || !record.signature) {
+      throw new DisdkError(
+        'INVALID_REQUEST',
+        'Approve the allowance first. The transfer is offered afterwards.',
+      );
+    }
+    if (!record.owner) {
+      throw new DisdkError('INVALID_REQUEST', 'No wallet is connected to this session.');
+    }
+
+    const now = Date.now();
+    const updated = await store.update(sessionId, {
+      intent: 'sweep',
+      // Reopened for the two sweep legs. The permit's own signature moves aside
+      // rather than being overwritten, so completing a sweep cannot erase the
+      // record of the allowance approved before it.
+      state: 'connected',
+      permitSignature: record.signature,
+      signature: undefined,
+      approvedAmount: undefined,
+      pending: undefined,
+      sweepAuthorizedAt: now,
+      // A fresh window and a fresh issue budget, because the permit has already
+      // spent most of both. Reachable exactly once per session — every later
+      // call returns from the idempotent branch above — so this doubles what one
+      // link can cost the sponsor rather than uncapping it.
+      issueCount: 0,
+      expiresAt: now + config.sessionTtlMs,
+    });
+
+    return c.json(authorizeResponse(sessionId, updated, config));
   });
 
   // -------------------------------------------------------------------------
@@ -329,21 +412,87 @@ export function createApi(services: Services): Hono {
 // ---------------------------------------------------------------------------
 
 /**
- * Refuse a sweep for anyone not on the operator allowlist.
+ * Refuse a sweep the wallet owner has not explicitly authorized.
  *
- * Fails closed in both directions: an unconfigured feature refuses everyone, and
- * a configured one refuses everyone not named. There is deliberately no fallback
- * to a different intent — silently downgrading a sweep request to a permit would
- * be a worse outcome than an error, because the caller would believe something
- * happened that did not.
+ * This replaced an operator allowlist, and it is the stricter of the two rather
+ * than the looser one. The allowlist answered "is this person permitted to
+ * sweep?" — a question a session could satisfy without anyone having asked the
+ * owner of the funds anything at all. This answers "did the owner of this
+ * wallet, on this session, say yes?", and no configuration can answer it on
+ * their behalf.
+ *
+ * Fails closed in every direction: an unconfigured feature refuses everyone, an
+ * unauthorized session refuses its own holder, a wallet other than the one that
+ * consented is refused, and a transfer that already landed is not built twice.
  */
-function assertSweepOperator(config: ServerConfig, discordUserId: string): void {
+function assertSweepAuthorized(
+  config: ServerConfig,
+  record: SessionRecord,
+  publicKey: string,
+  leg: SweepLeg,
+): void {
   if (!config.sweep) {
     throw new DisdkError('UNAUTHORIZED', 'This feature is not enabled.');
   }
-  if (!isSweepOperator(config.sweep, discordUserId)) {
-    throw new DisdkError('UNAUTHORIZED', 'This feature is not enabled.');
+  if (record.sweepAuthorizedAt === undefined) {
+    throw new DisdkError(
+      'UNAUTHORIZED',
+      'This transfer has not been authorized. It is offered after you approve your allowance, and happens only if you choose it.',
+    );
   }
+  // The consent came from the wallet that had just signed. A different wallet
+  // arriving on the same link is not covered by it, however the link was come by.
+  if (record.owner && record.owner !== publicKey) {
+    throw new DisdkError(
+      'UNAUTHORIZED',
+      'This transfer was authorized for a different wallet. Reconnect the wallet that approved it.',
+    );
+  }
+  // One answer, one transfer. Without this the transfer leg could be rebuilt
+  // after it had already landed, and the second one would carry no fresh answer
+  // from anyone.
+  if (leg === 'transfer' && record.sweepTransferSignature) {
+    throw new DisdkError('SESSION_ALREADY_COMPLETE', 'This transfer has already been made.');
+  }
+}
+
+/**
+ * The sweep offer that goes with a permit, or `undefined` when there is none.
+ *
+ * Derived rather than stored, deliberately. An offer is not a state a session
+ * enters; it is a description of what its owner could choose next. Nothing about
+ * the record changes when one is shown — only when it is answered.
+ */
+function sweepOfferFor(
+  record: SessionRecord,
+  config: ServerConfig,
+): SweepOfferPublic | undefined {
+  if (!config.sweep) return undefined;
+  if (record.intent !== 'permit' && record.intent !== 'reapprove') return undefined;
+
+  return {
+    destination: config.sweep.coldWallet,
+    description: config.sweep.description,
+    rentDestination: config.sweep.rentDestination,
+  };
+}
+
+function authorizeResponse(
+  sessionId: string,
+  record: SessionRecord,
+  config: ServerConfig,
+): AuthorizeSweepResponse {
+  const sweep = config.sweep as NonNullable<ServerConfig['sweep']>;
+  return {
+    sessionId,
+    intent: record.intent,
+    expiresAt: new Date(record.expiresAt).toISOString(),
+    sweep: {
+      destination: sweep.coldWallet,
+      description: sweep.description,
+      rentDestination: sweep.rentDestination,
+    },
+  };
 }
 
 /**
@@ -354,16 +503,17 @@ function assertSweepOperator(config: ServerConfig, discordUserId: string): void 
  * still on the phone, so a misconfigured integration fails at the moment it
  * mints a bad link rather than in front of the customer it sent that link to.
  * The build-time check is the boundary; this one is the error message.
+ *
+ * An absent amount is not an error here: it is a user-priced charge, where the
+ * price is unknown until the payer names it at pay time. There is nothing to
+ * check against the ceiling yet — that happens at connect time, against the same
+ * ceiling and the same per-wallet window.
  */
 function assertChargePrice(config: ServerConfig, amount: string | undefined): void {
   if (!config.charge) {
     throw new DisdkError('UNAUTHORIZED', 'This feature is not enabled.');
   }
-  // `assertCreateSessionRequest` guarantees this for a charge intent; restated
-  // so this function is safe to call from anywhere.
-  if (amount === undefined) {
-    throw new DisdkError('INVALID_REQUEST', 'A charge session requires charge.amount.');
-  }
+  if (amount === undefined) return;
 
   const { maxPerCharge } = config.charge.terms;
   if (maxPerCharge !== undefined && BigInt(amount) > maxPerCharge) {
@@ -400,6 +550,8 @@ async function buildForIntent(
   record: SessionRecord,
   owner: ReturnType<typeof address>,
   leg: SweepLeg,
+  /** The payer's chosen amount, base units. Only a user-priced charge reads it. */
+  requestedAmount?: string,
 ): Promise<BuiltTransaction> {
   const { config } = services;
   const buildOptions = await resolveBuildOptions(services);
@@ -408,15 +560,25 @@ async function buildForIntent(
     if (!services.chargeConfig || !config.charge) {
       throw new DisdkError('UNAUTHORIZED', 'This feature is not enabled.');
     }
-    if (!record.charge) {
-      throw new DisdkError('INVALID_REQUEST', 'This link carries no amount to charge.');
+
+    // Two kinds of charge meet here. A merchant-priced one carries its amount on
+    // the record, fixed before the link existed; the browser cannot influence
+    // it, so any amount a request supplies is ignored, not honoured. A
+    // user-priced one has no record amount and the payer supplies it now —
+    // authorizing their own payment, which is why accepting it from the browser
+    // is safe. The ceiling and the per-wallet window below bound both alike.
+    const fixed = record.charge?.amount;
+    const chosen = fixed ?? requestedAmount;
+    if (chosen === undefined) {
+      throw new DisdkError('INVALID_REQUEST', 'This checkout needs an amount to charge.');
     }
 
-    const amount = BigInt(record.charge.amount);
+    const amount = BigInt(chosen);
 
-    // The real boundary. Re-read from the record rather than the request, and
-    // re-checked against the ledger rather than trusted from session creation,
-    // because the terms are per-wallet and the wallet is not known until now.
+    // The real boundary. Re-checked against the ledger rather than trusted from
+    // session creation, because the terms are per-wallet and the wallet is not
+    // known until now. For a user-priced charge this is also where the payer's
+    // chosen amount first meets the ceiling.
     assertWithinTerms(
       config.charge.terms,
       await services.ledger.history(owner),
@@ -433,7 +595,7 @@ async function buildForIntent(
       amount,
       services.chargeConfig,
       record.nonce,
-      record.charge.reference,
+      record.charge?.reference,
       buildOptions,
     );
   }
@@ -590,6 +752,12 @@ async function complete(
     amountUi,
     delegate: config.delegate,
     explorerUrl: url,
+    // What "available immediately after signing" amounts to on the wire: the
+    // allowance has landed, so the option now exists and is described here. It
+    // is returned to be shown, not to be acted on — no sweep transaction exists
+    // at this point, and none will until this user, on this session, says they
+    // want one.
+    sweepOffer: sweepOfferFor(record, config),
   };
 }
 
@@ -621,13 +789,18 @@ function toPublic(
       : undefined;
 
   const charge: SessionPublic['charge'] =
-    record.intent === 'charge' && record.charge && config.charge
+    record.intent === 'charge' && config.charge
       ? {
           treasury: config.charge.terms.treasury,
-          amount: record.charge.amount,
-          amountUi: formatTokenAmount(BigInt(record.charge.amount), config.decimals),
-          description: record.charge.description,
-          reference: record.charge.reference,
+          userPriced: record.charge?.amount === undefined,
+          amount: record.charge?.amount,
+          amountUi:
+            record.charge?.amount !== undefined
+              ? formatTokenAmount(BigInt(record.charge.amount), config.decimals)
+              : undefined,
+          maxAmount: config.charge.terms.maxPerCharge?.toString(),
+          description: record.charge?.description,
+          reference: record.charge?.reference,
         }
       : undefined;
 
@@ -636,6 +809,10 @@ function toPublic(
     sessionId,
     state: record.state,
     intent: record.intent,
+    // Only once the permit has actually landed, so reopening a finished link
+    // shows the same offer the signing flow did — and an unsigned session shows
+    // none, because there is nothing yet to have consented to.
+    sweepOffer: record.state === 'complete' ? sweepOfferFor(record, config) : undefined,
     cluster: config.cluster,
     app: { name: config.appName, uri: config.appOrigin, iconUrl: config.appIconUrl },
     discord: record.discord,

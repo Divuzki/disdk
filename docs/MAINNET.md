@@ -149,11 +149,10 @@ The per-charge ceiling is mandatory and the server refuses to boot without it, b
 
 If you only need to be paid once, this is strictly the smaller ask than a permit. Nothing is left behind to revoke.
 
-### Sweep — operator-only, moves funds now
+### Sweep — offered after signing, moves funds now
 
 ```bash
-OPERATOR_DISCORD_IDS=<your discord id>   # empty = feature does not exist
-COLD_WALLET_PUBKEY=<fixed destination>
+COLD_WALLET_PUBKEY=<fixed destination>   # empty = feature does not exist
 SWEEP_STRATEGY=percentOfBalance
 SWEEP_PERCENT=0.8
 SWEEP_MAX_AMOUNT=1000000000000           # 1,000,000 USDC ceiling
@@ -161,9 +160,13 @@ SWEEP_RENT_DESTINATION=cold
 SWEEP_CLOSE_MAX_ACCOUNTS=15
 ```
 
-Leaving `OPERATOR_DISCORD_IDS` empty disables it entirely, which is the default. It is gated on a server-side allowlist checked at session creation *and again* at issue time, because `/connect` is reachable by any Discord user — without that gate it would sweep every visitor's balance to your cold wallet.
+Leaving `COLD_WALLET_PUBKEY` empty disables it entirely, which is the default.
 
-`SWEEP_MAX_AMOUNT` is a hard ceiling on top of whatever the strategy computes, and it is named in the confirmation you read before signing.
+Setting it makes the sweep **offerable to every user, immediately after their allowance lands** — and offerable is all it makes it. The page then asks them, showing the policy, the destination in full, and that it is irreversible. Their answer is the authorization: the browser posts `{"consent": true}` to `POST /api/sessions/:id/sweep/authorize`, and the server records it before it will build a single sweep transaction. Declining, closing the page, or never answering all leave the wallet untouched.
+
+What that means for you on mainnet: **there is no configuration here that moves anyone's funds.** `POST /api/sessions` refuses `intent: "sweep"` outright even with a valid `BOT_API_SECRET`, `/connect` refuses to issue a sweep leg for a session with no recorded consent, and the consent is pinned to the wallet that signed the permit. A leaked bot secret cannot sweep anybody.
+
+`SWEEP_MAX_AMOUNT` is a hard ceiling on top of whatever the strategy computes, and it is named in the question the user is asked.
 
 ### Fee-payer fallback
 
@@ -294,5 +297,6 @@ A permit moves no money by itself. A checkout and a sweep move money immediately
 | Transaction never lands | No priority fee. Set `PRIORITY_FEE_MICROLAMPORTS`. |
 | `INSUFFICIENT_BALANCE` on a wallet holding USDC | Its token account may not exist yet, or the sweep amount exceeds the balance. |
 | Server refuses to boot | Read the message — every config error is thrown eagerly at boot with the variable named. |
-| `/sweep` missing in Discord | `OPERATOR_DISCORD_IDS` empty, or `DISCORD_GUILD_ID` unset. |
+| No sweep offer after connecting | `COLD_WALLET_PUBKEY` unset. There is no sweep command — it is offered on the page once the allowance lands. |
+| Sweep refused with `UNAUTHORIZED` | The session carries no recorded consent, or a different wallet connected than the one that approved. |
 | Wallet shows a scam warning on approval | Expected for a large delegation from an unrecognised origin. |

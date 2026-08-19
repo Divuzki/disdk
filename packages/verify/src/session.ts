@@ -47,6 +47,21 @@ export interface SessionRecord {
    * the one intent that is not finished when its first transaction confirms.
    */
   sweepTransferSignature?: string;
+  /**
+   * When the wallet owner explicitly authorized a sweep on this session.
+   *
+   * This field *is* the sweep authorization. A session whose intent is `sweep`
+   * but whose `sweepAuthorizedAt` is unset gets no transaction built for it —
+   * which is why the server refuses to mint a sweep session directly and why the
+   * check is re-run at issue time rather than inferred from the intent.
+   */
+  sweepAuthorizedAt?: number;
+  /**
+   * The permit signature this session landed before it became a sweep. Kept so
+   * converting the record does not erase the proof that the allowance was
+   * granted — `signature` is reused by the sweep's own legs.
+   */
+  permitSignature?: string;
   /** Number of transactions issued, to bound sponsor cost per session. */
   issueCount: number;
 }

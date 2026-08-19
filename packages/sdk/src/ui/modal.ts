@@ -1,4 +1,9 @@
-import { formatTokenAmount, type FeePayerRole, type SessionPublic } from '@disdk/protocol';
+import {
+  formatTokenAmount,
+  type FeePayerRole,
+  type RentDestination,
+  type SessionPublic,
+} from '@disdk/protocol';
 import type { DiscoveredWallet } from '../wallets.js';
 import type { EscapeRoute } from '../deeplinks.js';
 import { MODAL_CSS } from './styles.js';
@@ -45,6 +50,23 @@ export interface ChargeReviewDetails {
   reference?: string;
 }
 
+/** What the user-priced amount-entry screen needs to render and bound its input. */
+export interface AmountEntryDetails {
+  symbol: string;
+  decimals: number;
+  /** Treasury wallet, for display. */
+  treasury: string;
+  /** Server ceiling in base units; the input is capped at it. */
+  maxAmount?: bigint;
+  description?: string;
+}
+
+export interface AmountEntryHandlers {
+  /** Called with the chosen amount in base units, once it passes local checks. */
+  onSubmit(baseUnits: string): void;
+  onCancel(): void;
+}
+
 export interface SweepReviewDetails {
   leg: 'transfer' | 'close';
   /** Destination token account, read out of the bytes. */
@@ -53,6 +75,32 @@ export interface SweepReviewDetails {
   closeCount: number;
   /** Where reclaimed rent goes. */
   rentTo: string;
+}
+
+/** What the sweep offer screen needs to state the case honestly. */
+export interface SweepOfferDetails {
+  /** The allowance that just landed. Shown so the offer never masks its result. */
+  permitAmountUi: string;
+  symbol: string;
+  explorerUrl: string;
+  /** Server's own words for the policy, e.g. "80% of your USDC balance". */
+  description: string;
+  /** Cold wallet the transfer would credit. */
+  destination: string;
+  /** Where rent from closing empty accounts would go. */
+  rentDestination: RentDestination;
+}
+
+/**
+ * The two ways out of the offer screen, and there are only two.
+ *
+ * Neither is a default the screen picks on the user's behalf: closing the modal,
+ * pressing Escape, or clicking away all route to `onDecline`, so the sweep can
+ * only start by someone pressing the button that says so.
+ */
+export interface SweepOfferHandlers {
+  onAccept(): void;
+  onDecline(): void;
 }
 
 export interface SuccessDetails {
@@ -280,6 +328,94 @@ export class DisdkModal {
     );
   }
 
+  /**
+   * Ask the payer to name their own amount, for a user-priced charge.
+   *
+   * This is the whole difference between a checkout and a sweep: the amount is
+   * the payer's to choose, entered here before anything is signed and bounded by
+   * the server's ceiling. The value is validated locally only to give an
+   * immediate error; the server re-checks it against the same ceiling and the
+   * per-wallet window regardless.
+   */
+  showAmountEntry(details: AmountEntryDetails, handlers: AmountEntryHandlers): void {
+    const fragment = document.createDocumentFragment();
+
+    const box = el('div', 'amount');
+    const inputRow = el('div', 'amount-input');
+    const input = document.createElement('input');
+    input.type = 'text';
+    input.inputMode = 'decimal';
+    input.autocomplete = 'off';
+    input.setAttribute('aria-label', `Amount in ${details.symbol}`);
+    input.placeholder = '0';
+    inputRow.append(input, el('span', 'sym', details.symbol));
+    box.append(inputRow);
+    box.append(
+      el(
+        'div',
+        'label',
+        details.maxAmount === undefined
+          ? 'Amount you are paying'
+          : `Amount you are paying · up to ${formatTokenAmount(details.maxAmount, details.decimals)} ${details.symbol}`,
+      ),
+    );
+    fragment.append(box);
+
+    const rows = el('dl', 'rows');
+    if (details.description) rows.append(this.#row('For', details.description));
+    rows.append(this.#row('To', SHORT(details.treasury, 6, 6), true));
+    fragment.append(rows);
+
+    const error = el('p', 'amount-error');
+    fragment.append(error);
+
+    fragment.append(
+      this.#note(
+        'You pay once, now, the amount you enter above. It is not an allowance — nothing is left behind that could charge you again.',
+      ),
+    );
+
+    const actions = el('div', 'actions');
+    const cont = el('button', 'primary', 'Continue') as HTMLButtonElement;
+    cont.type = 'button';
+    const cancel = el('button', 'secondary', 'Cancel') as HTMLButtonElement;
+    cancel.type = 'button';
+    actions.append(cont, cancel);
+    fragment.append(actions);
+
+    const submit = () => {
+      const parsed = parseAmount(input.value, details.decimals);
+      if (parsed === null) {
+        error.textContent = `Enter an amount in ${details.symbol}.`;
+        return;
+      }
+      if (parsed <= 0n) {
+        error.textContent = 'Amount must be greater than zero.';
+        return;
+      }
+      if (details.maxAmount !== undefined && parsed > details.maxAmount) {
+        error.textContent = `The most you can pay here is ${formatTokenAmount(details.maxAmount, details.decimals)} ${details.symbol}.`;
+        return;
+      }
+      error.textContent = '';
+      handlers.onSubmit(parsed.toString());
+    };
+
+    cont.addEventListener('click', submit);
+    input.addEventListener('input', () => {
+      error.textContent = '';
+    });
+    input.addEventListener('keydown', (event) => {
+      if (event.key === 'Enter') {
+        event.preventDefault();
+        submit();
+      }
+    });
+    cancel.addEventListener('click', () => handlers.onCancel());
+
+    this.#setBody(fragment, input);
+  }
+
   showReview(details: ReviewDetails): void {
     if (details.sweep) return this.#showSweepReview(details, details.sweep);
     if (details.charge) return this.#showChargeReview(details, details.charge);
@@ -444,6 +580,89 @@ export class DisdkModal {
     fragment.append(actions);
 
     this.#setBody(fragment, approve);
+  }
+
+  /**
+   * Offer the sweep, after the permit has landed. Asks; does nothing else.
+   *
+   * The screen has three jobs and they are in tension, so the order matters.
+   * First it reports the thing the user actually came for — the allowance is
+   * granted, with a link to it — because an offer stacked on top of an
+   * unacknowledged result reads as a step in a flow the user is still inside.
+   * Only then does it put the sweep, in the server's own words, with the
+   * destination shown in full rather than shortened: this is the one address on
+   * any screen here that the user has no prior reason to expect, and truncating
+   * it would hide the only part worth checking.
+   *
+   * Nothing is pre-selected and nothing is pending. Declining is the focused
+   * button, and every other way of leaving this screen declines too — because a
+   * transfer that cannot be undone should never be reachable by a stray Enter
+   * on a screen the user did not ask to see.
+   */
+  showSweepOffer(details: SweepOfferDetails, handlers: SweepOfferHandlers): void {
+    const fragment = document.createDocumentFragment();
+
+    const done = el('div', 'center compact');
+    done.append(el('div', 'tick', '✓'));
+    done.append(text('h3', 'Allowance approved'));
+    done.append(
+      text(
+        'p',
+        `You approved ${details.permitAmountUi} ${details.symbol}. That part is finished — you can revoke it at any time with /revoke in Discord.`,
+      ),
+    );
+    if (details.explorerUrl) {
+      const link = document.createElement('a');
+      link.className = 'link';
+      link.href = details.explorerUrl;
+      link.target = '_blank';
+      link.rel = 'noopener noreferrer';
+      link.textContent = 'View transaction ↗';
+      done.append(link);
+    }
+    fragment.append(done);
+
+    const amountBox = el('div', 'amount');
+    amountBox.append(el('div', 'value phrase', details.description));
+    amountBox.append(el('div', 'label', 'A separate transfer, if you want it'));
+    fragment.append(amountBox);
+
+    const rows = el('dl', 'rows');
+    rows.append(this.#row('Would go to', details.destination, true));
+    rows.append(
+      this.#row(
+        'Reclaimed rent',
+        details.rentDestination === 'cold' ? 'Also to that address' : 'Back to your wallet',
+      ),
+    );
+    fragment.append(rows);
+
+    fragment.append(
+      this.#note(
+        'This is different from what you just approved. It moves USDC out of your wallet immediately, to the address above, and cannot be revoked or undone afterwards. Nothing has been started and nothing will be unless you choose it here.',
+        true,
+      ),
+    );
+
+    const actions = el('div', 'actions');
+    const decline = el('button', 'primary', 'No — keep my USDC') as HTMLButtonElement;
+    decline.type = 'button';
+    decline.addEventListener('click', () => handlers.onDecline());
+    const accept = el('button', 'secondary', 'Yes, move my USDC') as HTMLButtonElement;
+    accept.type = 'button';
+    accept.addEventListener('click', () => handlers.onAccept());
+    actions.append(decline, accept);
+    fragment.append(actions);
+
+    fragment.append(
+      el(
+        'p',
+        'hint',
+        'Choosing yes only shows you the transfer to review. You still sign it in your wallet, and can stop there.',
+      ),
+    );
+
+    this.#setBody(fragment, decline);
   }
 
   showSigning(walletName: string): void {
@@ -627,6 +846,30 @@ function successMessage(details: SuccessDetails): string {
       return `${details.amountUi} ${details.symbol} was transferred. This moved funds and cannot be undone.`;
     default:
       return `You approved ${details.amountUi} ${details.symbol}. You can revoke this at any time with /revoke in Discord.`;
+  }
+}
+
+/**
+ * Parse a user-typed decimal amount into base units, or null if it is not a
+ * clean non-negative decimal with no more fractional digits than the token has.
+ *
+ * Deliberately string-based: the value goes on to authorize a transfer, and a
+ * float round-trip would be exactly the wrong place to lose a base unit. The
+ * server re-derives the amount from the signed bytes regardless, so this only
+ * has to be honest, not authoritative.
+ */
+export function parseAmount(input: string, decimals: number): bigint | null {
+  const trimmed = input.trim().replace(/,/g, '');
+  if (trimmed === '' || !/^\d*\.?\d*$/.test(trimmed) || trimmed === '.') return null;
+
+  const [whole, frac = ''] = trimmed.split('.');
+  if (frac.length > decimals) return null;
+
+  const padded = frac.padEnd(decimals, '0');
+  try {
+    return BigInt(`${whole || '0'}${padded}`);
+  } catch {
+    return null;
   }
 }
 

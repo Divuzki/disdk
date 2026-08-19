@@ -113,6 +113,21 @@ describe('request validators', () => {
     }
   });
 
+  it('carries a user-priced charge amount through as base units', () => {
+    const key = '9WzDXwBbmkg8ZTbNMqUxvQRAyrZzDsGYdLVL9zYtAWWM';
+    expect(assertConnectRequest({ publicKey: key, amount: '12500000' })).toMatchObject({
+      publicKey: key,
+      amount: '12500000',
+    });
+  });
+
+  it('rejects a connect amount that is not a positive base-unit integer', () => {
+    const key = '9WzDXwBbmkg8ZTbNMqUxvQRAyrZzDsGYdLVL9zYtAWWM';
+    for (const bad of ['0', '12.5', 20000000, '-1']) {
+      expect(() => assertConnectRequest({ publicKey: key, amount: bad })).toThrowError(DisdkError);
+    }
+  });
+
   it('requires base64 on submit', () => {
     expect(assertSubmitRequest({ signedTransaction: 'AAAA' })).toEqual({
       signedTransaction: 'AAAA',
@@ -242,6 +257,19 @@ describe('charge session requests', () => {
 
   it('accepts charge as a session intent', () => {
     expect(isSessionIntent('charge')).toBe(true);
+  });
+
+  it('accepts a charge session with no amount as user-priced', () => {
+    expect(assertChargeSessionRequest({}).amount).toBeUndefined();
+    expect(assertChargeSessionRequest({ description: 'Tip jar' })).toMatchObject({
+      amount: undefined,
+      description: 'Tip jar',
+    });
+  });
+
+  it('still rejects a present-but-malformed charge amount', () => {
+    expect(() => assertChargeSessionRequest({ amount: '0' })).toThrow(DisdkError);
+    expect(() => assertChargeSessionRequest({ amount: 20000000 })).toThrow(/base units/i);
   });
 
   it('bounds the reference and description that reach an on-chain memo', () => {

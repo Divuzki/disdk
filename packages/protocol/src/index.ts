@@ -63,12 +63,16 @@ export type SessionState =
  *
  * `sweep` and `charge` differ from each other in who chose the amount and who
  * benefits. A sweep moves a configured *share of the user's balance* to the
- * operator's own cold wallet, so it is restricted to a server-side operator
- * allowlist. A charge moves a *specific price* the merchant named up front to
- * the merchant's treasury, in exchange for something — so it needs no
- * allowlist, but it does need the amount to be fixed before the user ever sees
- * it, and it is capped by the same {@link ChargeTerms} that bound the
- * delegate-pull charge service.
+ * operator's own cold wallet. A charge moves a *specific price* the merchant
+ * named up front to the merchant's treasury, in exchange for something — so it
+ * needs the amount to be fixed before the user ever sees it, and it is capped by
+ * the same {@link ChargeTerms} that bound the delegate-pull charge service.
+ *
+ * A `sweep` session is never minted directly. It exists only as the
+ * continuation of a permit session whose owner, having signed and seen what a
+ * sweep would do, explicitly authorized one — see {@link AuthorizeSweepRequest}.
+ * That consent is the whole authorization: nobody else can create one, and the
+ * server issues no sweep transaction for a session that does not carry it.
  *
  * What `charge` is not: it is not an allowance and it does not create one. The
  * user signs one transfer, for one amount, once. Nothing outlives it, which is
@@ -108,6 +112,23 @@ export function isSweepLeg(value: unknown): value is SweepLeg {
 
 /** Where rent reclaimed by closing empty token accounts is sent. */
 export type RentDestination = 'cold' | 'source';
+
+/**
+ * The sweep put to a user once their permit has been signed and landed.
+ *
+ * An offer and nothing more. Its presence in a response says the option now
+ * exists for this session; it never says anything has been started, and no
+ * transaction is built for it until the user answers
+ * {@link AuthorizeSweepRequest} in the affirmative.
+ */
+export interface SweepOfferPublic {
+  /** Cold wallet the transfer would credit. Server config; never client-supplied. */
+  destination: string;
+  /** e.g. "80% of your USDC balance". */
+  description: string;
+  /** Where rent from closing empty token accounts would go. */
+  rentDestination: RentDestination;
+}
 
 // ---------------------------------------------------------------------------
 // Errors
@@ -199,6 +220,12 @@ export interface SessionPublic {
    * see this there is nothing left for it to influence.
    */
   charge?: ChargePublic;
+  /**
+   * Present on a permit session that has completed, when the server has a sweep
+   * configured. This is the option being offered — never a sweep in progress,
+   * and never something the browser can act on by itself.
+   */
+  sweepOffer?: SweepOfferPublic;
   expiresAt: string;
   /** Set once the flow has completed successfully. */
   signature?: string;
@@ -222,10 +249,26 @@ export interface SweepPublic {
 export interface ChargePublic {
   /** Merchant treasury *wallet*, from server config. Never client-supplied. */
   treasury: string;
-  /** Price in base units, fixed at session creation. */
-  amount: string;
-  /** Formatted for display, e.g. "20.00". */
-  amountUi: string;
+  /**
+   * True when the payer names their own amount at pay time rather than the
+   * merchant naming it up front. On a user-priced charge `amount`/`amountUi` are
+   * absent — there is no price until the payer chooses one — and the SDK prompts
+   * for it, bounded by `maxAmount`.
+   */
+  userPriced: boolean;
+  /**
+   * Price in base units. Present on a merchant-priced charge, fixed at session
+   * creation; absent on a user-priced one until the payer enters it.
+   */
+  amount?: string;
+  /** Formatted for display, e.g. "20.00". Absent on a user-priced charge. */
+  amountUi?: string;
+  /**
+   * Largest amount this charge may be, in base units — the server's
+   * `CHARGE_MAX_PER_CHARGE`. Bounds the payer's input on a user-priced charge;
+   * the server re-checks it regardless.
+   */
+  maxAmount?: string;
   /** What the user is paying for, shown on the review screen. */
   description?: string;
   /** Merchant's own order or invoice id, carried into the on-chain memo. */
@@ -239,6 +282,15 @@ export interface ConnectRequest {
    * `transfer`, so the funds move before any account is closed.
    */
   leg?: SweepLeg;
+  /**
+   * The amount to charge, in base units. Only for a user-priced charge, where
+   * the payer chose it: they are authorizing their own transfer of their own
+   * funds, so — unlike a merchant-named price — it is safe to accept from the
+   * browser. Ignored on every other intent, and refused on a merchant-priced
+   * charge, whose amount is already settled. Bounded server-side by
+   * `CHARGE_MAX_PER_CHARGE`, never trusted from here.
+   */
+  amount?: string;
 }
 
 /**
@@ -328,6 +380,16 @@ export interface CompleteResponse {
   amountUi: string;
   delegate: string;
   explorerUrl: string;
+  /**
+   * Set when a permit has just landed and the server has a sweep configured —
+   * this is what "available immediately after signing" means on the wire.
+   *
+   * It is an offer to put on screen, not an instruction to act on. The SDK shows
+   * it and stops; only an explicit answer from the user reaches
+   * `POST /api/sessions/:id/sweep/authorize`, and only that call makes a sweep
+   * issuable at all.
+   */
+  sweepOffer?: SweepOfferPublic;
 }
 
 export interface PermitStatus {
@@ -364,8 +426,14 @@ export interface CreateSessionRequest {
  * pay.
  */
 export interface ChargeSessionRequest {
-  /** Base units, as a string — a JSON number silently loses precision past 2^53. */
-  amount: string;
+  /**
+   * Base units, as a string — a JSON number silently loses precision past 2^53.
+   *
+   * Omit to create a user-priced charge: no price is fixed up front, and the
+   * payer names their own amount at pay time (bounded by `CHARGE_MAX_PER_CHARGE`).
+   * A present amount is a merchant-priced charge, settled before the link exists.
+   */
+  amount?: string;
   /** Shown on the review screen, e.g. "Pro plan, 1 month". */
   description?: string;
   /** The merchant's order or invoice id, written into the on-chain memo. */
@@ -376,6 +444,29 @@ export interface CreateSessionResponse {
   sessionId: string;
   url: string;
   expiresAt: string;
+}
+
+/**
+ * The user's answer to a sweep offer, sent from their own browser on their own
+ * session.
+ *
+ * The body carries one field and it must be literally `true`. That is not
+ * ceremony: it makes an accidental or replayed empty POST — the shape a
+ * misbehaving client or an over-eager retry produces — fail rather than read as
+ * consent to move funds.
+ */
+export interface AuthorizeSweepRequest {
+  consent: true;
+}
+
+export interface AuthorizeSweepResponse {
+  sessionId: string;
+  /** Always `sweep`: the session has been converted by this call. */
+  intent: SessionIntent;
+  /** Fresh window for the two sweep legs to be signed in. */
+  expiresAt: string;
+  /** What was authorized, echoed back so the client can show it unchanged. */
+  sweep: SweepOfferPublic;
 }
 
 // ---------------------------------------------------------------------------
@@ -427,7 +518,31 @@ export function assertConnectRequest(body: unknown): ConnectRequest {
   return {
     publicKey: record.publicKey,
     leg: record.leg as SweepLeg | undefined,
+    // Validated as a positive base-unit integer here; the real ceiling and the
+    // per-wallet window are enforced server-side against config the browser
+    // cannot see.
+    amount: record.amount === undefined ? undefined : assertBaseUnitAmount(record.amount, 'amount').toString(),
   };
+}
+
+/**
+ * Validate a sweep authorization.
+ *
+ * Deliberately strict about the one field it has. `consent` must be the boolean
+ * `true` — not `"true"`, not `1`, not merely present. Every other validator here
+ * is lenient about shape where it can afford to be; this one guards the single
+ * moment a user turns an offer into a transferable session, so anything short of
+ * an unambiguous yes is a no.
+ */
+export function assertAuthorizeSweepRequest(body: unknown): AuthorizeSweepRequest {
+  const record = asRecord(body);
+  if (record.consent !== true) {
+    throw new DisdkError(
+      'INVALID_REQUEST',
+      'consent must be true. A sweep is only authorized by an explicit choice.',
+    );
+  }
+  return { consent: true };
 }
 
 export function assertSubmitRequest(body: unknown): SubmitRequest {
@@ -483,13 +598,19 @@ export function assertCreateSessionRequest(body: unknown): CreateSessionRequest 
 /**
  * Validate the price on a charge session.
  *
- * Rejected rather than defaulted when absent: there is no sane default price,
- * and a charge session that reached the browser without one would either fail
- * later or — far worse — be completed with an amount nobody chose deliberately.
+ * The amount is optional, and its presence is what distinguishes the two kinds
+ * of charge. Present: a merchant-priced charge, settled before the link exists
+ * so the browser cannot alter it. Absent: a user-priced charge, where the payer
+ * names their own amount at pay time — safe to accept from the browser precisely
+ * because they are authorizing their own payment, and still bounded server-side
+ * by `CHARGE_MAX_PER_CHARGE`. What is never allowed is an amount that is present
+ * but not a positive base-unit integer.
  */
 export function assertChargeSessionRequest(value: unknown): ChargeSessionRequest {
   const record = asRecord(value);
-  const amount = assertBaseUnitAmount(record.amount, 'charge.amount');
+  // Absent amount is a user-priced charge: the payer names it at pay time. A
+  // present amount is a merchant-priced charge, settled here and now.
+  const amount = record.amount === undefined ? undefined : assertBaseUnitAmount(record.amount, 'charge.amount');
 
   if (record.description !== undefined && typeof record.description !== 'string') {
     throw new DisdkError('INVALID_REQUEST', 'charge.description must be a string');
@@ -508,7 +629,7 @@ export function assertChargeSessionRequest(value: unknown): ChargeSessionRequest
   }
 
   return {
-    amount: amount.toString(),
+    amount: amount?.toString(),
     description: typeof record.description === 'string' ? record.description : undefined,
     reference: typeof record.reference === 'string' ? record.reference : undefined,
   };

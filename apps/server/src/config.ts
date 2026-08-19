@@ -74,9 +74,9 @@ export interface ServerConfig {
   allowAnonymousSessions: boolean;
 
   /**
-   * Operator-only USDC consolidation. `null` when the feature is off, which is
-   * the default and the state of any deployment that has not deliberately
-   * configured an operator allowlist.
+   * User-authorized USDC consolidation. `null` when the feature is off, which is
+   * the default and the state of any deployment that has not configured a
+   * destination for it.
    */
   sweep: SweepSettings | null;
 
@@ -98,14 +98,16 @@ export interface ServerConfig {
 }
 
 /**
- * Sweep is the only capability here that moves funds outright, so it is gated on
- * an explicit allowlist of Discord user IDs rather than on any property of the
- * request. Every other flow in this server is safe to offer to an arbitrary
- * Discord user who clicks a link; this one is not.
+ * Sweep is the only capability here that moves a share of whatever the caller's
+ * wallet happens to hold, to an address this deployment chose. Configuring it
+ * decides *where* and *how much*; it decides nothing about *whether*.
+ *
+ * That last question belongs to the wallet owner and is answered per session,
+ * after they have signed their permit and been shown what a sweep would do. The
+ * server stores the answer on the session record and issues nothing without it,
+ * so these settings describe an offer, never a standing permission.
  */
 export interface SweepSettings {
-  /** Discord user IDs permitted to start a sweep. Never empty when non-null. */
-  operatorIds: ReadonlySet<string>;
   /** Fixed destination. Not derivable from anything a client sends. */
   coldWallet: Address;
   strategy: AmountStrategy;
@@ -259,33 +261,26 @@ function parseUnitLimit(raw: string | undefined): number | undefined {
  * Read the sweep configuration, or `null` to leave the feature off.
  *
  * Off is the default and the only state that requires no thought. Turning it on
- * takes a deliberate, non-empty `OPERATOR_DISCORD_IDS`; every other sweep
- * setting is then validated eagerly so a misconfiguration surfaces at boot
+ * takes a `COLD_WALLET_PUBKEY` — the one setting a sweep cannot be invented
+ * without, since a transfer with nowhere to go is not a half-configured feature
+ * but a request to choose a destination on the operator's behalf. Every other
+ * sweep setting is then validated eagerly so a misconfiguration surfaces at boot
  * rather than at the moment someone is about to move money.
+ *
+ * Configuring this makes the sweep *offerable*, not automatic. Nothing here
+ * authorizes a transfer from anyone's wallet; each user is asked after they sign
+ * and their answer is recorded on their own session.
  */
 function loadSweepSettings(
   env: NodeJS.ProcessEnv,
   symbol: string,
   decimals: number,
 ): SweepSettings | null {
-  const operatorIds = new Set(
-    (env.OPERATOR_DISCORD_IDS ?? '')
-      .split(',')
-      .map((id) => id.trim())
-      .filter(Boolean),
-  );
+  const coldWallet = env.COLD_WALLET_PUBKEY?.trim();
 
-  // No operators means the feature does not exist — for everyone, including a
-  // correctly configured Discord ID. This is the fail-closed default.
-  if (operatorIds.size === 0) return null;
-
-  const coldWallet = env.COLD_WALLET_PUBKEY;
-  if (!coldWallet) {
-    throw new DisdkError(
-      'INTERNAL_ERROR',
-      'COLD_WALLET_PUBKEY is required when OPERATOR_DISCORD_IDS is set. Refusing to start a sweep-enabled server with no destination.',
-    );
-  }
+  // No destination means the feature does not exist. This is the fail-closed
+  // default, and it is what every deployment gets until it says otherwise.
+  if (!coldWallet) return null;
 
   const strategy = parseStrategy({
     strategy: env.SWEEP_STRATEGY,
@@ -323,7 +318,6 @@ function loadSweepSettings(
   }
 
   return {
-    operatorIds,
     coldWallet: address(coldWallet),
     strategy,
     maxAmount,
@@ -334,32 +328,18 @@ function loadSweepSettings(
 }
 
 /**
- * The one authorization question that matters for a sweep. Deliberately takes
- * the whole settings object rather than the id set, so "feature off" and "not
- * an operator" cannot drift apart at a call site.
- */
-export function isSweepOperator(
-  sweep: SweepSettings | null,
-  discordUserId: string | undefined,
-): boolean {
-  if (!sweep || !discordUserId) return false;
-  return sweep.operatorIds.has(discordUserId);
-}
-
-/**
  * Read the checkout configuration, or `null` to leave the feature off.
  *
  * Off is the default. Turning it on takes a `TREASURY_ADDRESS`, and every other
  * charge setting is then validated eagerly, so a bad limit surfaces at boot
  * rather than at the moment a customer is waiting on a payment screen.
  *
- * Note what is *not* gated here. A sweep needs an operator allowlist because it
- * moves a share of whatever the caller's wallet happens to hold, to the
- * operator's own address — offering that to a stranger would be indefensible. A
- * charge moves a price the merchant published, in exchange for something, and
- * the payer signs it while looking at it. Strangers are the intended audience,
- * so the protection it needs is a cap on what any one of them can be charged,
- * which is what {@link ChargeTerms} is.
+ * Note what is *not* gated here. A charge moves a price the merchant published,
+ * in exchange for something, and the payer signs it while looking at it.
+ * Strangers are the intended audience, so the protection it needs is a cap on
+ * what any one of them can be charged, which is what {@link ChargeTerms} is. A
+ * sweep is bounded differently — not by a price the user is told in advance, but
+ * by a per-session answer the user gives after being shown the terms.
  */
 function loadChargeSettings(
   env: NodeJS.ProcessEnv,
