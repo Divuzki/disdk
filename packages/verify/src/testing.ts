@@ -55,6 +55,8 @@ export interface MockRpc {
   /** Transactions accepted by `sendTransaction`, keyed by signature. */
   submitted: Map<string, string>;
   setTokenAccount(ata: Address, account: MockTokenAccount): void;
+  /** Set an account's SOL balance, for exercising the fee-payer fallback. */
+  setLamports(addr: Address, lamports: bigint): void;
 }
 
 const TEST_BLOCKHASH = '11111111111111111111111111111111';
@@ -62,8 +64,19 @@ const TEST_BLOCKHASH = '11111111111111111111111111111111';
 export function createMockRpc(options: MockRpcOptions = {}): MockRpc {
   const tokenAccounts = options.tokenAccounts ?? new Map<Address, MockTokenAccount>();
   const submitted = new Map<string, string>();
+  const lamports = new Map<Address, bigint>();
 
   const rpc = {
+    // Defaults to a comfortably funded sponsor, so every existing test keeps
+    // the sponsor-pays behaviour without opting in to anything.
+    getBalance(addr: Address) {
+      return {
+        send: async () => ({
+          context: { slot: 1n },
+          value: lamports.get(addr) ?? 1_000_000_000n,
+        }),
+      };
+    },
     getAccountInfo(addr: Address) {
       return {
         send: async () => {
@@ -169,6 +182,9 @@ export function createMockRpc(options: MockRpcOptions = {}): MockRpc {
     submitted,
     setTokenAccount(ata, account) {
       tokenAccounts.set(ata, account);
+    },
+    setLamports(addr, value) {
+      lamports.set(addr, value);
     },
   };
 }

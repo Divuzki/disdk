@@ -8,8 +8,39 @@
  * refused before the wallet is ever asked to sign.
  */
 
-import { DisdkError } from '@disdk/protocol';
+import { DisdkError, type FeePayerRole } from '@disdk/protocol';
 import { base58Encode, base64Decode } from './codec.js';
+
+/**
+ * Judge the server's fee-payer claim before any per-flow check trusts it.
+ *
+ * Every other guard here compares the bytes against what the server said. That
+ * is not enough for the fee payer: the server chooses the claim too, so on its
+ * own a compromised server could name the *user* as fee payer and the client
+ * would have nothing to disagree with. Only two accounts are ever legitimate —
+ * the session's sponsor, or the wallet doing the signing — and which one it is
+ * has to match the role the server declared, so the fee cannot move onto the
+ * user while the screen still says the sponsor is paying.
+ */
+export function assertFeePayerAllowed(
+  claim: { feePayer: string; feePayerRole?: FeePayerRole },
+  sponsor: string,
+  owner: string,
+): FeePayerRole {
+  const role: FeePayerRole = claim.feePayerRole ?? 'sponsor';
+  const expected = role === 'owner' ? owner : sponsor;
+
+  if (claim.feePayer !== expected) {
+    throw new DisdkError(
+      'UNSAFE_TRANSACTION',
+      role === 'owner'
+        ? 'This transaction says you pay the network fee, but names a different account.'
+        : 'This transaction would be paid for by an account that is not the sponsor.',
+    );
+  }
+
+  return role;
+}
 
 export const SYSTEM_PROGRAM = '11111111111111111111111111111111';
 export const COMPUTE_BUDGET_PROGRAM = 'ComputeBudget111111111111111111111111111111';
@@ -396,6 +427,7 @@ function assertCommonSafety(
   expectedFeePayer: string,
 ): void {
   const { decoded } = inspection;
+
 
   if (decoded.usesAddressLookupTables) {
     throw new DisdkError(

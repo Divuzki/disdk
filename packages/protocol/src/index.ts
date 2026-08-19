@@ -179,6 +179,13 @@ export interface SessionPublic {
   mintSymbol: string;
   decimals: number;
   delegate: string;
+  /**
+   * The sponsor that normally pays network fees. Published so the SDK can judge
+   * a transaction's fee payer for itself rather than trusting the server's word
+   * for it — without this, a server could name the user as fee payer and the
+   * client would have nothing to compare against.
+   */
+  sponsor: string;
   /** Human-readable description of the allowance policy, e.g. "80% of your USDC balance". */
   allowanceDescription: string;
   /**
@@ -234,8 +241,20 @@ export interface ConnectRequest {
   leg?: SweepLeg;
 }
 
+/**
+ * Who pays the network fee for a transaction.
+ *
+ * `sponsor` is the point of this SDK — the user needs no SOL. `owner` is the
+ * fallback for a sponsor that has run dry: the user already signs every flow
+ * here, so paying their own fee costs them one signature's worth of SOL rather
+ * than a failed transaction. It is never silent — the SDK refuses any fee payer
+ * that is neither the session's sponsor nor the connected wallet, and says on
+ * screen which one is paying.
+ */
+export type FeePayerRole = 'sponsor' | 'owner';
+
 export interface ConnectResponse {
-  /** Base64 transaction, already partially signed by the sponsor fee payer. */
+  /** Base64 transaction, partially signed by the sponsor unless the owner pays. */
   transaction: string;
   /** Base-unit amount encoded in the transaction. The SDK verifies this against the bytes. */
   amount: string;
@@ -247,6 +266,12 @@ export interface ConnectResponse {
   decimals: number;
   delegate: string;
   feePayer: string;
+  /**
+   * Which account `feePayer` is. The SDK checks this against the decoded bytes
+   * and against the session's sponsor, so the server cannot quietly move the
+   * fee onto the user while still claiming the sponsor pays.
+   */
+  feePayerRole: FeePayerRole;
   owner: string;
   /** Blockhash validity horizon. Past this the transaction must be rebuilt. */
   expiresAt: string;

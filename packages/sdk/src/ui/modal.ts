@@ -1,4 +1,4 @@
-import { formatTokenAmount, type SessionPublic } from '@disdk/protocol';
+import { formatTokenAmount, type FeePayerRole, type SessionPublic } from '@disdk/protocol';
 import type { DiscoveredWallet } from '../wallets.js';
 import type { EscapeRoute } from '../deeplinks.js';
 import { MODAL_CSS } from './styles.js';
@@ -15,6 +15,12 @@ export interface ReviewDetails {
   publicKey: string;
   createsAccount: boolean;
   isUnlimited: boolean;
+  /**
+   * Who pays the network fee. Shown plainly, because "paid for you" is the
+   * promise this SDK makes and a fallback to the user paying is a change to
+   * that promise, not a detail.
+   */
+  feePayerRole?: FeePayerRole;
   /**
    * Present only for a sweep. Its presence changes the screen from "you are
    * granting an allowance" to "you are moving funds", which are different enough
@@ -74,6 +80,15 @@ const INSTALL_LINKS = [
   { name: 'Solflare', url: 'https://solflare.com/download' },
   { name: 'Backpack', url: 'https://backpack.app/downloads' },
 ];
+
+/**
+ * What the fee row says. The fallback case names a number because "you pay the
+ * fee" invites the reader to imagine a large one — it is a signature's worth of
+ * SOL, and saying so is the difference between a disclosure and a scare.
+ */
+function feeNote(role: FeePayerRole | undefined): string {
+  return role === 'owner' ? 'You pay it (about 0.000005 SOL)' : 'Paid for you';
+}
 
 const SHORT = (value: string, lead = 4, tail = 4) =>
   value.length <= lead + tail + 1 ? value : `${value.slice(0, lead)}…${value.slice(-tail)}`;
@@ -268,7 +283,7 @@ export class DisdkModal {
     const rows = el('dl', 'rows');
     rows.append(this.#row('Wallet', `${details.walletName} · ${SHORT(details.publicKey)}`));
     rows.append(this.#row('Spender', SHORT(details.delegate, 6, 6), true));
-    rows.append(this.#row('Network fee', 'Paid for you'));
+    rows.append(this.#row('Network fee', feeNote(details.feePayerRole)));
     fragment.append(rows);
 
     fragment.append(
@@ -329,7 +344,7 @@ export class DisdkModal {
     } else {
       rows.append(this.#row('Rent to', SHORT(sweep.rentTo, 6, 6), true));
     }
-    rows.append(this.#row('Network fee', 'Paid for you'));
+    rows.append(this.#row('Network fee', feeNote(details.feePayerRole)));
     fragment.append(rows);
 
     fragment.append(
@@ -389,7 +404,7 @@ export class DisdkModal {
     rows.append(this.#row('Wallet', `${details.walletName} · ${SHORT(details.publicKey)}`));
     rows.append(this.#row('To', SHORT(charge.treasury, 6, 6), true));
     if (charge.reference) rows.append(this.#row('Reference', charge.reference));
-    rows.append(this.#row('Network fee', 'Paid for you'));
+    rows.append(this.#row('Network fee', feeNote(details.feePayerRole)));
     fragment.append(rows);
 
     fragment.append(

@@ -25,10 +25,12 @@ import {
   buildSweepCloseTransaction,
   buildSweepTransferTransaction,
   getPermitStatus,
+  resolveFeePayer,
   secretEquals,
   submitAndConfirm,
   verifyOnChainPermit,
   verifySignedTransaction,
+  type BuildOptions,
   type BuiltTransaction,
   type SessionRecord,
 } from '@disdk/verify';
@@ -204,6 +206,7 @@ export function createApi(services: Services): Hono {
       decimals: config.decimals,
       delegate: config.delegate,
       feePayer: built.feePayer,
+      feePayerRole: built.feePayerRole,
       owner: built.owner,
       expiresAt: built.expiresAt,
       sweep: sweepResponse(built, services),
@@ -312,6 +315,7 @@ export function createApi(services: Services): Hono {
       decimals: config.decimals,
       delegate: config.delegate,
       feePayer: built.feePayer,
+      feePayerRole: built.feePayerRole,
       owner: built.owner,
       expiresAt: built.expiresAt,
     };
@@ -377,6 +381,17 @@ async function buildForIntent(
 ): Promise<BuiltTransaction> {
   const { config } = services;
 
+  // Asked once per build, before any branch, so every intent degrades the same
+  // way. With the fallback off this is a constant and costs no RPC call.
+  const buildOptions: BuildOptions = {
+    feePayerRole: await resolveFeePayer(services.rpc, config.sponsor.address, {
+      fallbackEnabled: config.feePayerFallback,
+      minLamports: config.sponsorMinLamports,
+    }),
+    priorityFeeMicroLamports: config.priorityFeeMicroLamports,
+    computeUnitLimit: config.computeUnitLimit,
+  };
+
   if (record.intent === 'charge') {
     if (!services.chargeConfig || !config.charge) {
       throw new DisdkError('UNAUTHORIZED', 'This feature is not enabled.');
@@ -407,6 +422,7 @@ async function buildForIntent(
       services.chargeConfig,
       record.nonce,
       record.charge.reference,
+      buildOptions,
     );
   }
 
@@ -423,6 +439,7 @@ async function buildForIntent(
           owner,
           services.sweepConfig,
           record.nonce,
+          buildOptions,
         )
       : buildSweepTransferTransaction(
           services.rpc,
@@ -430,6 +447,7 @@ async function buildForIntent(
           owner,
           services.sweepConfig,
           record.nonce,
+          buildOptions,
         );
   }
 
@@ -440,6 +458,7 @@ async function buildForIntent(
       owner,
       { mint: config.mint, decimals: config.decimals },
       record.nonce,
+      buildOptions,
     );
   }
 
@@ -449,6 +468,7 @@ async function buildForIntent(
     owner,
     services.permitConfig,
     record.nonce,
+    buildOptions,
   );
 }
 
@@ -611,6 +631,7 @@ function toPublic(
     mintSymbol: config.mintSymbol,
     decimals: config.decimals,
     delegate: config.delegate,
+    sponsor: config.sponsor.address,
     allowanceDescription: config.allowanceDescription,
     sweep,
     charge,

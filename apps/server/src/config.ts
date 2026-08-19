@@ -38,6 +38,30 @@ export interface ServerConfig {
   maxAmount?: bigint;
   allowanceDescription: string;
 
+  /**
+   * Let the connecting wallet pay its own network fee when the sponsor cannot.
+   *
+   * Off by default, and deliberately so: "the user needs no SOL" is the premise
+   * of this SDK, and a deployment that quietly starts charging users for fees
+   * has changed its bargain with them. On, a dry sponsor degrades to a working
+   * transaction the user pays for instead of a failure — which the SDK states
+   * on the review screen before anything is signed.
+   */
+  feePayerFallback: boolean;
+  /** Balance below which the sponsor is considered unable to pay, in lamports. */
+  sponsorMinLamports?: bigint;
+
+  /**
+   * Priority fee bid, in micro-lamports per compute unit.
+   *
+   * Unset means no bid, which is fine on a quiet cluster and a liability on
+   * mainnet: under congestion a transaction with no priority fee can sit until
+   * its blockhash expires and the user sees it simply fail.
+   */
+  priorityFeeMicroLamports?: bigint;
+  /** Compute unit limit, so the priority bid is not spread over unused units. */
+  computeUnitLimit?: number;
+
   sessionTtlMs: number;
   botApiSecret: string;
   corsOrigins: string[];
@@ -161,6 +185,14 @@ export async function loadConfig(env: NodeJS.ProcessEnv = process.env): Promise<
     maxAmount: parseCeiling(env.APPROVE_MAX_AMOUNT, 'APPROVE_MAX_AMOUNT'),
     allowanceDescription: describeStrategy(strategy, mintSymbol, decimals),
 
+    feePayerFallback: env.FEE_PAYER_FALLBACK === 'true',
+    sponsorMinLamports: parseCeiling(env.SPONSOR_MIN_LAMPORTS, 'SPONSOR_MIN_LAMPORTS'),
+    priorityFeeMicroLamports: parseCeiling(
+      env.PRIORITY_FEE_MICROLAMPORTS,
+      'PRIORITY_FEE_MICROLAMPORTS',
+    ),
+    computeUnitLimit: parseUnitLimit(env.COMPUTE_UNIT_LIMIT),
+
     sweep: loadSweepSettings(env, mintSymbol, decimals),
     charge: loadChargeSettings(env, mintSymbol, decimals),
 
@@ -206,6 +238,20 @@ function parseCeiling(raw: string | undefined, name: string): bigint | undefined
     throw new DisdkError('INTERNAL_ERROR', `${name} must be greater than zero, got "${raw}"`);
   }
 
+  return value;
+}
+
+/** Compute unit limits are a u32, so they are a number rather than a bigint. */
+function parseUnitLimit(raw: string | undefined): number | undefined {
+  if (raw === undefined || raw.trim() === '') return undefined;
+
+  const value = Number(raw);
+  if (!Number.isInteger(value) || value <= 0 || value > 1_400_000) {
+    throw new DisdkError(
+      'INTERNAL_ERROR',
+      `COMPUTE_UNIT_LIMIT must be a positive integer up to 1400000, got "${raw}"`,
+    );
+  }
   return value;
 }
 

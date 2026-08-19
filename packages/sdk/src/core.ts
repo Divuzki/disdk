@@ -11,6 +11,7 @@ import { Emitter, type DisdkEventMap, type DisdkState } from './events.js';
 import { detectEnvironment, type Environment } from './environment.js';
 import { planEscape, type EscapeRoute } from './deeplinks.js';
 import {
+  assertFeePayerAllowed,
   verifyChargeTransfer,
   verifyPermitTransaction,
   verifySweepClose,
@@ -542,6 +543,7 @@ function reviewPermit(
   walletName: string,
   issued: ConnectResponse,
 ): ReviewDetails {
+  const feePayerRole = assertFeePayerAllowed(issued, session.sponsor, owner);
   const verified = verifyPermitTransaction(issued.transaction, {
     feePayer: issued.feePayer,
     owner,
@@ -560,6 +562,7 @@ function reviewPermit(
     publicKey: owner,
     createsAccount: verified.createsAccount,
     isUnlimited: verified.amount >= U64_MAX,
+    feePayerRole,
   };
 }
 
@@ -569,6 +572,7 @@ function reviewSweep(
   walletName: string,
   issued: ConnectResponse,
 ): ReviewDetails {
+  const feePayerRole = assertFeePayerAllowed(issued, session.sponsor, owner);
   const claim = issued.sweep;
   if (!claim) {
     throw new DisdkError('UNSAFE_TRANSACTION', 'The server did not describe this sweep.');
@@ -581,6 +585,7 @@ function reviewSweep(
     walletName,
     publicKey: owner,
     isUnlimited: false,
+    feePayerRole,
   };
 
   if (claim.leg === 'close') {
@@ -633,6 +638,7 @@ function reviewCharge(
   walletName: string,
   issued: ConnectResponse,
 ): ReviewDetails {
+  const feePayerRole = assertFeePayerAllowed(issued, session.sponsor, owner);
   const claim = issued.charge;
   if (!claim) {
     throw new DisdkError('UNSAFE_TRANSACTION', 'The server did not describe this charge.');
@@ -667,6 +673,7 @@ function reviewCharge(
     publicKey: owner,
     createsAccount: verified.createsAccount,
     isUnlimited: false,
+    feePayerRole,
     charge: {
       destination: verified.destination,
       treasury: claim.treasury,

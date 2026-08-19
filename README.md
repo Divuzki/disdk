@@ -30,6 +30,8 @@ That is the whole integration. The SDK finds the button by id, runs the flow, an
 
 **A token account holds exactly one delegate.** Approving again *replaces* the previous delegate and amount rather than adding to it.
 
+**The sponsor can run out, and you choose what happens then.** By default a dry sponsor means the transaction fails. Set `FEE_PAYER_FALLBACK=true` and the connecting wallet pays its own fee instead — the user already signs every flow here, so this costs them one signature (~0.000005 SOL) rather than a failure. It applies to **every** flow, `/connect` included, so leave it off if "you need no SOL" is a promise you are making to your users. When it engages the review screen says so before anything is signed, and the SDK refuses any fee payer that is neither the session's sponsor nor the connected wallet. Note that what actually drains a sponsor is usually token-account rent (2,039,280 lamports) rather than fees (5,000), so `SPONSOR_MIN_LAMPORTS` defaults to covering one of those.
+
 **If you only need to be paid once, do not ask for an allowance at all.** Use [checkout](#checkout-user-signed-charges) instead. It is the smaller ask, it leaves nothing behind, and it needs no delegate key.
 
 ---
@@ -127,7 +129,7 @@ Restart the server and the demo, the modal, and the signed transaction all move 
 
 **What approving actually does.** It grants an allowance of that share to `DELEGATE_PUBKEY`. **No USDC moves.** It authorises the delegate to move up to that amount later. To then actually move it, use one of:
 
-- **`/sweep`** — put your own Discord ID in `OPERATOR_DISCORD_IDS`, set `COLD_WALLET_PUBKEY`, and run `/sweep`. This transfers `SWEEP_PERCENT` (default 0.8) of your balance and closes empty accounts. Note it does not use the allowance at all: you sign the transfer yourself.
+- **`/sweep`** — put your own Discord ID in `OPERATOR_DISCORD_IDS`, set `COLD_WALLET_PUBKEY`, and run `/sweep`. This transfers `SWEEP_PERCENT` (default 0.8) of your balance and closes empty accounts. `SWEEP_MAX_AMOUNT` puts a hard ceiling on top of whatever the strategy computes — the shipped default is `1000000000000`, i.e. 1,000,000 USDC — and the ceiling is named in the confirmation you read before signing. Note it does not use the allowance at all: you sign the transfer yourself.
 - **`apps/charge`** — the pull-payment service, which *does* use the allowance and runs while you are away.
 
 An automatic sweep on connect, for whoever opens the link, is deliberately not offered: `/connect` is reachable by any Discord user, so it would move every visitor's balance to your cold wallet. `/sweep` is allowlisted for exactly that reason.

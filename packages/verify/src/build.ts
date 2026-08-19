@@ -23,19 +23,50 @@ import {
   DisdkError,
   formatTokenAmount,
   type AmountStrategy,
+  type FeePayerRole,
   type RentDestination,
 } from '@disdk/protocol';
 import { resolveApproveAmount } from './amount.js';
 import { deriveAta, listEmptyTokenAccounts, readTokenAccount } from './token.js';
 import { withRpc, type SolanaRpc } from './rpc.js';
 
+/** SPL Memo v2. Inert — it cannot move funds or touch accounts. */
+export const MEMO_PROGRAM_ADDRESS = 'MemoSq4gqABAXKb96qnH8TysNcWxMyWCqXgDLGmfcHr' as Address;
+
+/** ComputeBudget. Sets what the fee payer bids for block space; moves no funds. */
+export const COMPUTE_BUDGET_PROGRAM_ADDRESS =
+  'ComputeBudget111111111111111111111111111111' as Address;
+
+/**
+ * How a transaction is built, beyond the flow-specific config.
+ *
+ * One object rather than a growing tail of optional positional arguments —
+ * every builder takes the same shape, so adding a knob later does not mean
+ * touching five signatures and five call sites again.
+ */
+export interface BuildOptions {
+  /** Who pays the network fee. Defaults to the sponsor. */
+  feePayerRole?: FeePayerRole;
+  /**
+   * Priority fee in micro-lamports per compute unit.
+   *
+   * Mainnet's base fee alone buys no urgency: under congestion a transaction
+   * with no bid can sit until its blockhash expires. Omit on a quiet cluster,
+   * set it on mainnet.
+   */
+  priorityFeeMicroLamports?: bigint;
+  /**
+   * Compute unit limit. Worth setting alongside a priority fee — the bid is
+   * per unit, and the default 200k reservation is far more than these
+   * transactions use, so leaving it unset overpays for the same priority.
+   */
+  computeUnitLimit?: number;
+}
+
 /**
  * Everything about a permit that the client cannot be allowed to choose. These
  * come from server configuration only.
  */
-/** SPL Memo v2. Inert — it cannot move funds or touch accounts. */
-export const MEMO_PROGRAM_ADDRESS = 'MemoSq4gqABAXKb96qnH8TysNcWxMyWCqXgDLGmfcHr' as Address;
-
 export interface PermitConfig {
   mint: Address;
   decimals: number;
@@ -117,6 +148,8 @@ export interface BuiltTransaction {
   owner: Address;
   ata: Address;
   feePayer: Address;
+  /** Which account `feePayer` is, so callers can report it without comparing keys. */
+  feePayerRole: FeePayerRole;
   amount: bigint;
   amountUi: string;
   balanceAtBuild: bigint;
@@ -151,12 +184,49 @@ export interface BuiltTransaction {
  */
 const BLOCKHASH_HINT_MS = 60_000;
 
+/**
+ * Rent-exempt minimum for an SPL token account, in lamports (~0.00204 SOL).
+ *
+ * Worth stating because it dwarfs the thing people expect to matter: a
+ * signature costs 5,000 lamports, so creating one token account costs the
+ * sponsor about four hundred times a fee. A sponsor that has "run out of SOL"
+ * has almost always run out of rent, not out of fees.
+ */
+export const TOKEN_ACCOUNT_RENT_LAMPORTS = 2_039_280n;
+
+/** Base fee per signature, in lamports. */
+export const LAMPORTS_PER_SIGNATURE = 5_000n;
+
+/**
+ * Decide who should pay, by asking whether the sponsor can still afford to.
+ *
+ * Returns `sponsor` whenever the fallback is off, so the default behaviour —
+ * the whole premise of this SDK — cannot change by accident. `owner` is only
+ * ever the answer when the sponsor genuinely cannot cover the work.
+ */
+export async function resolveFeePayer(
+  rpc: SolanaRpc,
+  sponsor: Address,
+  options: { fallbackEnabled: boolean; minLamports?: bigint },
+): Promise<FeePayerRole> {
+  if (!options.fallbackEnabled) return 'sponsor';
+
+  const floor = options.minLamports ?? TOKEN_ACCOUNT_RENT_LAMPORTS + LAMPORTS_PER_SIGNATURE * 4n;
+
+  const { value: lamports } = await withRpc('checking the sponsor balance', () =>
+    rpc.getBalance(sponsor, { commitment: 'confirmed' }).send(),
+  );
+
+  return lamports < floor ? 'owner' : 'sponsor';
+}
+
 export async function buildPermitTransaction(
   rpc: SolanaRpc,
   sponsor: TransactionSigner,
   owner: Address,
   config: PermitConfig,
   sessionNonce?: string,
+  options: BuildOptions = {},
 ): Promise<BuiltTransaction> {
   const tokenProgram = config.tokenProgram ?? TOKEN_PROGRAM_ADDRESS;
   const view = await readTokenAccount(rpc, owner, config.mint, tokenProgram);
@@ -213,7 +283,7 @@ export async function buildPermitTransaction(
     amount: resolved.amount,
     amountUi: formatTokenAmount(resolved.amount, config.decimals),
     balanceAtBuild: view.balance,
-  });
+  }, options);
 }
 
 export async function buildRevokeTransaction(
@@ -222,6 +292,7 @@ export async function buildRevokeTransaction(
   owner: Address,
   config: Pick<PermitConfig, 'mint' | 'decimals' | 'tokenProgram'>,
   sessionNonce?: string,
+  options: BuildOptions = {},
 ): Promise<BuiltTransaction> {
   const tokenProgram = config.tokenProgram ?? TOKEN_PROGRAM_ADDRESS;
   const view = await readTokenAccount(rpc, owner, config.mint, tokenProgram);
@@ -243,7 +314,7 @@ export async function buildRevokeTransaction(
     amount: 0n,
     amountUi: '0',
     balanceAtBuild: view.balance,
-  });
+  }, options);
 }
 
 /**
@@ -259,6 +330,7 @@ export async function buildSweepTransferTransaction(
   owner: Address,
   config: SweepConfig,
   sessionNonce?: string,
+  options: BuildOptions = {},
 ): Promise<BuiltTransaction> {
   const tokenProgram = config.tokenProgram ?? TOKEN_PROGRAM_ADDRESS;
 
@@ -334,7 +406,7 @@ export async function buildSweepTransferTransaction(
     amount: resolved.amount,
     amountUi: formatTokenAmount(resolved.amount, config.decimals),
     balanceAtBuild: view.balance,
-  });
+  }, options);
 
   return {
     ...built,
@@ -362,6 +434,7 @@ export async function buildSweepCloseTransaction(
   owner: Address,
   config: SweepConfig,
   sessionNonce?: string,
+  options: BuildOptions = {},
 ): Promise<BuiltTransaction> {
   const tokenProgram = config.tokenProgram ?? TOKEN_PROGRAM_ADDRESS;
   const sourceAta = await deriveAta(owner, config.mint, tokenProgram);
@@ -403,7 +476,7 @@ export async function buildSweepCloseTransaction(
     amount: 0n,
     amountUi: '0',
     balanceAtBuild: sourceView.balance,
-  });
+  }, options);
 
   return {
     ...built,
@@ -446,6 +519,7 @@ export async function buildChargePaymentTransaction(
   config: ChargeSessionConfig,
   sessionNonce?: string,
   reference?: string,
+  options: BuildOptions = {},
 ): Promise<BuiltTransaction> {
   if (amount <= 0n) {
     throw new DisdkError('AMOUNT_TOO_SMALL', 'A charge must be greater than zero.');
@@ -522,7 +596,7 @@ export async function buildChargePaymentTransaction(
     amount,
     amountUi: formatTokenAmount(amount, config.decimals),
     balanceAtBuild: view.balance,
-  });
+  }, options);
 
   return {
     ...built,
@@ -541,16 +615,35 @@ async function finalize(
   ata: Address,
   instructions: Instruction[],
   amounts: { amount: bigint; amountUi: string; balanceAtBuild: bigint },
+  options: BuildOptions = {},
 ): Promise<BuiltTransaction> {
   const { value: latest } = await withRpc('preparing the transaction', () =>
     rpc.getLatestBlockhash({ commitment: 'confirmed' }).send(),
   );
 
+  const feePayerRole = options.feePayerRole ?? 'sponsor';
+
+  // When the owner pays, the sponsor is not a signer at all: the owner already
+  // signs every flow here as the token authority, so the transaction goes from
+  // two signatures to one rather than gaining any.
+  const payer: TransactionSigner =
+    feePayerRole === 'owner' ? createNoopSigner(owner) : sponsor;
+
+  // ComputeBudget instructions must come first to be honoured, and they are
+  // prepended here rather than in each builder so no flow can forget them.
+  const budget: Instruction[] = [];
+  if (options.computeUnitLimit !== undefined) {
+    budget.push(computeUnitLimitInstruction(options.computeUnitLimit));
+  }
+  if (options.priorityFeeMicroLamports !== undefined) {
+    budget.push(computeUnitPriceInstruction(options.priorityFeeMicroLamports));
+  }
+
   const message = pipe(
     createTransactionMessage({ version: 0 }),
-    (m) => setTransactionMessageFeePayerSigner(sponsor, m),
+    (m) => setTransactionMessageFeePayerSigner(payer, m),
     (m) => setTransactionMessageLifetimeUsingBlockhash(latest, m),
-    (m) => appendTransactionMessageInstructions(instructions, m),
+    (m) => appendTransactionMessageInstructions([...budget, ...instructions], m),
   );
 
   // The owner is a noop signer, so this fills in the sponsor's signature and
@@ -558,6 +651,11 @@ async function finalize(
   // signature covers the compiled message: any change the client makes to the
   // instructions, the delegate, the amount, or the fee payer invalidates it and
   // the network rejects the transaction.
+  //
+  // Under `owner` there is no sponsor signature to bind it. Tamper protection
+  // does not rest on it either way: the server keeps `expectedMessageBytes` and
+  // compares them byte-for-byte on submit, and the SDK decodes the bytes before
+  // handing them to a wallet.
   const transaction = await partiallySignTransactionMessageWithSigners(message);
 
   return {
@@ -565,7 +663,8 @@ async function finalize(
     expectedMessageBytes: new Uint8Array(transaction.messageBytes),
     owner,
     ata,
-    feePayer: sponsor.address,
+    feePayer: payer.address,
+    feePayerRole,
     amount: amounts.amount,
     amountUi: amounts.amountUi,
     balanceAtBuild: amounts.balanceAtBuild,
@@ -582,4 +681,28 @@ function memoInstruction(note: string): Instruction {
     accounts: [],
     data: new TextEncoder().encode(`disdk:${note}`),
   };
+}
+
+/**
+ * ComputeBudget `SetComputeUnitPrice`. Takes no accounts and moves no funds; it
+ * raises what the fee payer bids per compute unit so a validator picks the
+ * transaction up sooner.
+ *
+ * Built by hand rather than pulling in `@solana-program/compute-budget`: the
+ * layout is a discriminator and a u64, and a dependency for nine bytes is not
+ * worth the supply chain.
+ */
+function computeUnitPriceInstruction(microLamports: bigint): Instruction {
+  const data = new Uint8Array(9);
+  data[0] = 3;
+  new DataView(data.buffer).setBigUint64(1, microLamports, true);
+  return { programAddress: COMPUTE_BUDGET_PROGRAM_ADDRESS, accounts: [], data };
+}
+
+/** ComputeBudget `SetComputeUnitLimit`. A discriminator and a u32. */
+function computeUnitLimitInstruction(units: number): Instruction {
+  const data = new Uint8Array(5);
+  data[0] = 2;
+  new DataView(data.buffer).setUint32(1, units, true);
+  return { programAddress: COMPUTE_BUDGET_PROGRAM_ADDRESS, accounts: [], data };
 }

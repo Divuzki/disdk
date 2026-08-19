@@ -17,8 +17,12 @@ export {
   buildSweepTransferTransaction,
   buildSweepCloseTransaction,
   buildChargePaymentTransaction,
+  resolveFeePayer,
+  LAMPORTS_PER_SIGNATURE,
+  TOKEN_ACCOUNT_RENT_LAMPORTS,
 } from './build.js';
 export type {
+  BuildOptions,
   BuiltTransaction,
   PermitConfig,
   SweepConfig,

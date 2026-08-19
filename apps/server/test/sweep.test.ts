@@ -29,6 +29,12 @@ const RANDOM_USER_ID = '2002';
 /** 1,000 USDC. */
 const BALANCE = 1_000_000_000n;
 
+/** 1,000,000 USDC — the configured sweep ceiling. */
+const CAP = 1_000_000_000_000n;
+
+/** 2,000,000 USDC, so the ceiling actually binds rather than sitting unused. */
+const OVER_CAP_BALANCE = 2_000_000_000_000n;
+
 interface Harness {
   app: Hono;
   mock: MockRpc;
@@ -36,7 +42,10 @@ interface Harness {
   config: Awaited<ReturnType<typeof loadConfig>>;
 }
 
-async function harness(envOverrides: Record<string, string> = {}): Promise<Harness> {
+async function harness(
+  envOverrides: Record<string, string> = {},
+  balance: bigint = BALANCE,
+): Promise<Harness> {
   const sponsor = await generateSponsorKeypair();
   const config = await loadConfig({
     CLUSTER: 'solana:devnet',
@@ -51,7 +60,7 @@ async function harness(envOverrides: Record<string, string> = {}): Promise<Harne
 
   const mock = createMockRpc();
   const owner = await generateKeyPairSigner();
-  await mockTokenAccountFor(mock, owner.address, MINT, BALANCE);
+  await mockTokenAccountFor(mock, owner.address, MINT, balance);
   await mockTokenAccountFor(mock, owner.address, OTHER_MINT, 0n);
 
   const services = createServices(config, { rpc: mock.rpc });
@@ -145,6 +154,7 @@ describe('sweep authorization', () => {
     expect((await createSession(app, '777', 'sweep')).status).toBe(201);
     expect((await createSession(app, RANDOM_USER_ID, 'sweep')).status).toBe(401);
   });
+});
 
 describe('sweep configuration', () => {
   it('refuses to boot with operators but no cold wallet', async () => {
@@ -164,6 +174,29 @@ describe('sweep configuration', () => {
     await expect(harness({ SWEEP_STRATEGY: 'unlimited' })).rejects.toThrow(
       /not meaningful for a one-time transfer/i,
     );
+  });
+
+  // A bad ceiling must fail at boot. A negative one in particular used to parse
+  // cleanly and only throw deep in amount resolution — at the exact moment
+  // someone was about to move money.
+  it('refuses a malformed sweep ceiling', async () => {
+    await expect(harness({ SWEEP_MAX_AMOUNT: 'lots' })).rejects.toThrow(
+      /SWEEP_MAX_AMOUNT must be a whole number/i,
+    );
+  });
+
+  it('refuses a zero or negative sweep ceiling', async () => {
+    await expect(harness({ SWEEP_MAX_AMOUNT: '0' })).rejects.toThrow(
+      /SWEEP_MAX_AMOUNT must be greater than zero/i,
+    );
+    await expect(harness({ SWEEP_MAX_AMOUNT: '-1' })).rejects.toThrow(
+      /SWEEP_MAX_AMOUNT must be greater than zero/i,
+    );
+  });
+
+  it('treats a blank sweep ceiling as no ceiling', async () => {
+    const { config } = await harness({ SWEEP_MAX_AMOUNT: '  ' });
+    expect(config.sweep?.maxAmount).toBeUndefined();
   });
 
   it('refuses an unknown rent destination', async () => {
@@ -213,6 +246,34 @@ describe('sweep two-leg flow', () => {
     expect(body.sweep.leg).toBe('transfer');
     expect(body.sweep.destination).toBe(await deriveAta(COLD_WALLET, MINT));
     expect(body.sweep.nextLeg).toBe('close');
+  });
+
+  // The ceiling is the whole point of SWEEP_MAX_AMOUNT: the strategy alone would
+  // move the entire balance here, so this fails the moment the cap stops being
+  // read anywhere along config -> services -> build.
+  it('clamps the transfer to SWEEP_MAX_AMOUNT when the strategy exceeds it', async () => {
+    const { app, owner } = await harness(
+      { SWEEP_MAX_AMOUNT: CAP.toString(), SWEEP_PERCENT: '1' },
+      OVER_CAP_BALANCE,
+    );
+    const sessionId = await operatorSession(app);
+
+    const response = await connect(app, sessionId, owner.address);
+    expect(response.status).toBe(200);
+
+    const body = (await response.json()) as { amount: string };
+    expect(body.amount).toBe(CAP.toString());
+  });
+
+  it('leaves a transfer under the ceiling untouched', async () => {
+    const { app, owner } = await harness({ SWEEP_MAX_AMOUNT: CAP.toString() });
+    const sessionId = await operatorSession(app);
+
+    const body = (await (await connect(app, sessionId, owner.address)).json()) as {
+      amount: string;
+    };
+    // 80% of 1,000 USDC, nowhere near the ceiling.
+    expect(body.amount).toBe('800000000');
   });
 
   it('issues a close leg naming the accounts it will close', async () => {
@@ -298,6 +359,21 @@ describe('sweep two-leg flow', () => {
     expect(view.intent).toBe('sweep');
     expect(view.sweep.destination).toBe(COLD_WALLET);
     expect(view.sweep.description).toBe('80% of your USDC balance');
+  });
+
+  // The description is the sentence the operator reads on the Discord confirm
+  // before anything moves, so a ceiling that binds has to appear in it.
+  it('names the ceiling in the policy description', async () => {
+    const { app } = await harness({ SWEEP_MAX_AMOUNT: CAP.toString() });
+    const sessionId = await operatorSession(app);
+
+    const view = (await (
+      await app.request(`/api/sessions/${encodeURIComponent(sessionId)}`)
+    ).json()) as { sweep: { description: string } };
+
+    expect(view.sweep.description).toBe(
+      '80% of your USDC balance, capped at 1,000,000.00 USDC',
+    );
   });
 
   it('does not attach sweep details to an ordinary permit session', async () => {
