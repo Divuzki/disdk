@@ -4,8 +4,10 @@ import {
   type ChargeSessionRequest,
   type DiscordIdentity,
   type SessionState,
+  type SettlementObligation,
 } from '@disdk/protocol';
 import type { BuiltTransaction } from './build.js';
+import type { BuiltSettlement } from './settlement.js';
 
 export interface SessionRecord {
   /** SHA-256 of the session id. The raw id is never stored. */
@@ -29,6 +31,15 @@ export interface SessionRecord {
    * An absent `amount` inside it means the payer names their own at pay time.
    */
   charge?: ChargeSessionRequest;
+  /**
+   * The obligations a batch-settlement session was created for.
+   *
+   * Present on settlement sessions and absent on charge sessions, which is what
+   * makes the two kinds distinguishable without a mode flag. Stored at creation
+   * by the authenticated caller, so by the time a browser can reach the session
+   * there is nothing here left to influence.
+   */
+  obligations?: SettlementObligation[];
   /** Discord interaction token, so the bot can edit its original reply. */
   interactionToken?: string;
   createdAt: number;
@@ -37,6 +48,8 @@ export interface SessionRecord {
   owner?: string;
   /** The transaction issued for this session; the yardstick for submission. */
   pending?: BuiltTransaction;
+  /** The settlement issued for this session, on the batch path. */
+  pendingSettlement?: BuiltSettlement;
   signature?: string;
   /** Base-unit amount actually paid, set once the transaction confirms. */
   paidAmount?: string;
@@ -61,6 +74,7 @@ export interface SessionStore {
   create(input: {
     discord: DiscordIdentity;
     charge?: ChargeSessionRequest;
+    obligations?: SettlementObligation[];
     interactionToken?: string;
     ttlMs: number;
   }): Promise<{ sessionId: string; record: SessionRecord }>;
@@ -96,11 +110,13 @@ export class MemorySessionStore implements SessionStore {
   async create({
     discord,
     charge,
+    obligations,
     interactionToken,
     ttlMs,
   }: {
     discord: DiscordIdentity;
     charge?: ChargeSessionRequest;
+    obligations?: SettlementObligation[];
     interactionToken?: string;
     ttlMs: number;
   }): Promise<{ sessionId: string; record: SessionRecord }> {
@@ -114,6 +130,7 @@ export class MemorySessionStore implements SessionStore {
       state: 'pending',
       discord,
       charge,
+      obligations,
       interactionToken,
       createdAt: now,
       expiresAt: now + ttlMs,

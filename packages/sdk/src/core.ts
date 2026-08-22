@@ -1,15 +1,24 @@
 import {
   DisdkError,
+  formatTokenAmount,
   type CompleteResponse,
   type Cluster,
   type ConnectResponse,
   type SessionPublic,
+  type SettlementCompleteResponse,
+  type SettlementConnectResponse,
 } from '@disdk/protocol';
 import { DisdkApi } from './api.js';
 import { Emitter, type DisdkEventMap, type DisdkState } from './events.js';
 import { detectEnvironment, type Environment } from './environment.js';
 import { planEscape, type EscapeRoute } from './deeplinks.js';
-import { assertFeePayerAllowed, verifyChargeTransaction } from './txguard.js';
+import {
+  assertFeePayerAllowed,
+  inspectTransaction,
+  verifyChargeTransaction,
+  verifySettlementTransaction,
+} from './txguard.js';
+import { resolveChainFacts } from './resolve.js';
 import { signSponsoredTransaction } from './signing.js';
 import {
   connectWallet,
@@ -20,7 +29,12 @@ import {
   type DiscoveredWallet,
   type WalletAccount,
 } from './wallets.js';
-import { DisdkModal, type ReviewDetails, type Theme } from './ui/modal.js';
+import {
+  DisdkModal,
+  type ReviewDetails,
+  type SettlementReviewDetails,
+  type Theme,
+} from './ui/modal.js';
 
 export interface DisdkConfig {
   /** Base URL of your disdk server, e.g. https://api.example.com */
@@ -33,6 +47,16 @@ export interface DisdkConfig {
   ui?: 'modal' | 'headless';
   /** Enables the desktop QR flow through Mobile Wallet Adapter. */
   remoteHostAuthority?: string;
+  /**
+   * A Solana RPC endpoint, used only to check a batch settlement against the
+   * chain before signing it — the contents of any lookup table it uses, and who
+   * the destination token accounts actually belong to.
+   *
+   * Required for {@link Disdk.settleBatch}, and for that alone. The charge flow
+   * needs no RPC because a charge names every account in the message, where the
+   * bytes are the whole story.
+   */
+  rpcUrl?: string;
 }
 
 export interface Disdk {
@@ -50,6 +74,17 @@ export interface Disdk {
    * authorization, and it is spent on use.
    */
   pay(): Promise<CompleteResponse>;
+  /**
+   * Put a batch settlement up for review and, once the user approves it, sign
+   * and settle it with one signature.
+   *
+   * The same bargain as {@link pay}, over a list: the transaction is the entire
+   * authorization, it grants no allowance, and nothing outlives it. Every
+   * transfer in it corresponds to an obligation the user was shown, and the
+   * correspondence is re-derived here from the transaction bytes before a
+   * wallet is asked for anything.
+   */
+  settleBatch(): Promise<SettlementCompleteResponse>;
   disconnect(): Promise<void>;
   listWallets(): DiscoveredWallet[];
   escapeRoute(): EscapeRoute;
@@ -96,8 +131,13 @@ class DisdkClient implements Disdk {
   #selected: DiscoveredWallet | null = null;
   #account: WalletAccount | null = null;
   #pending: ConnectResponse | null = null;
+  #pendingSettlement: SettlementConnectResponse | null = null;
 
   #flow: { resolve(value: CompleteResponse | null): void; reject(error: unknown): void } | null = null;
+  #settlementFlow: {
+    resolve(value: SettlementCompleteResponse | null): void;
+    reject(error: unknown): void;
+  } | null = null;
 
   constructor(config: DisdkConfig) {
     this.#config = config;
@@ -278,11 +318,57 @@ class DisdkClient implements Disdk {
     return result;
   }
 
+  async settleBatch(): Promise<SettlementCompleteResponse> {
+    const session = this.#session;
+    const account = this.#account;
+    const entry = this.#selected;
+
+    // The configuration is checked before the wallet, so a deployment that
+    // forgot the RPC finds out on the first call rather than at the moment a
+    // user has already connected. Refused rather than degraded: without an RPC
+    // the SDK cannot read a lookup table or confirm who a destination token
+    // account belongs to, and a settlement it cannot check is one it must not
+    // present as checked.
+    if (!this.#config.rpcUrl) {
+      throw new DisdkError(
+        'INVALID_REQUEST',
+        'settleBatch needs an rpcUrl so the settlement can be checked against the chain before signing.',
+      );
+    }
+    if (!session || !account || !entry) {
+      throw new DisdkError('INVALID_REQUEST', 'Connect a wallet before settling.');
+    }
+
+    this.#setState('reviewing');
+    const issued = await this.#api.connectSettlement(session.sessionId, account.address);
+
+    const review = await this.#reviewSettlement(session, account.address, entry.name, issued);
+    this.#pendingSettlement = issued;
+
+    if (this.#usesModal()) {
+      this.#modal?.showSettlementReview(review);
+      return new Promise<SettlementCompleteResponse>((resolve, reject) => {
+        this.#settlementFlow = {
+          resolve: (value) => {
+            if (value) resolve(value);
+            else reject(new DisdkError('WALLET_REJECTED', 'Cancelled.'));
+          },
+          reject,
+        };
+      });
+    }
+
+    const result = await this.#signSettlement();
+    if (!result) throw new DisdkError('INVALID_REQUEST', 'Nothing to sign.');
+    return result;
+  }
+
   async disconnect(): Promise<void> {
     if (this.#selected) await disconnectWallet(this.#selected);
     this.#selected = null;
     this.#account = null;
     this.#pending = null;
+    this.#pendingSettlement = null;
     this.#setState('idle');
     this.#emitter.emit('disconnect', undefined);
   }
@@ -293,6 +379,8 @@ class DisdkClient implements Disdk {
     this.#unwatch = null;
     this.#flow?.resolve(null);
     this.#flow = null;
+    this.#settlementFlow?.resolve(null);
+    this.#settlementFlow = null;
   }
 
   // -------------------------------------------------------------------------
@@ -363,6 +451,16 @@ class DisdkClient implements Disdk {
 
   async #approve(): Promise<void> {
     try {
+      // One approve button, two flows behind it. Which one is live is decided
+      // by what was issued, not by a mode flag that could disagree with it.
+      if (this.#pendingSettlement) {
+        const settled = await this.#signSettlement();
+        if (settled === null) return;
+        this.#settlementFlow?.resolve(settled);
+        this.#settlementFlow = null;
+        return;
+      }
+
       const result = await this.#sign();
       if (result === null) return;
       this.#flow?.resolve(result);
@@ -402,6 +500,129 @@ class DisdkClient implements Disdk {
     return this.#finish(result);
   }
 
+  /**
+   * Check the issued settlement against the chain and against its own manifest,
+   * before anything is shown to the user or handed to a wallet.
+   *
+   * Three separate questions, none of which the server gets to answer for
+   * itself: is the fee payer one of the two accounts it may be; do the lookup
+   * tables and destination accounts hold what the transaction implies; and do
+   * the transfers in the bytes correspond exactly to the obligations on screen.
+   */
+  async #reviewSettlement(
+    session: SessionPublic,
+    owner: string,
+    walletName: string,
+    issued: SettlementConnectResponse,
+  ): Promise<SettlementReviewDetails> {
+    const feePayerRole = assertFeePayerAllowed(issued, session.sponsor, owner);
+    const manifest = issued.manifest;
+
+    if (manifest.owner !== owner) {
+      throw new DisdkError(
+        'SETTLEMENT_MISMATCH',
+        'This settlement was prepared for a different wallet.',
+      );
+    }
+    if (Date.parse(manifest.expiresAt) <= Date.now()) {
+      throw new DisdkError('SETTLEMENT_EXPIRED', 'This settlement has expired. Start again.');
+    }
+
+    const rpcUrl = this.#config.rpcUrl as string;
+
+    // The tables come first, and on their own. Nothing in the transaction can
+    // be read until they are: an instruction that names an account by index
+    // into a table is unreadable without that table's contents, so there is no
+    // earlier point at which the destinations could be picked out.
+    const { lookupTables } = await resolveChainFacts({
+      rpcUrl,
+      lookupTables: issued.addressLookupTables,
+      candidates: {},
+      destination: manifest.destination,
+    });
+
+    // Now the transaction can be read. The destination each transfer credits is
+    // taken from the bytes and then checked on chain — reading it here is not
+    // trusting it, because `verifySettlementTransaction` below requires the
+    // transfer to credit exactly the account confirmed to belong to the
+    // destination wallet.
+    const inspection = inspectTransaction(
+      issued.transaction,
+      (table) => lookupTables[table],
+    );
+    const candidates: Record<string, string> = {};
+    for (const transfer of inspection.transfers) {
+      if (transfer.mint) candidates[transfer.mint] = transfer.destination;
+    }
+
+    const { destinationAccounts } = await resolveChainFacts({
+      rpcUrl,
+      lookupTables: [],
+      candidates,
+      destination: manifest.destination,
+    });
+
+    const verified = verifySettlementTransaction(issued.transaction, {
+      feePayer: issued.feePayer,
+      owner,
+      destination: manifest.destination,
+      obligations: manifest.obligations,
+      lookupTables,
+      destinationAccounts,
+    });
+
+    return {
+      lines: verified.transfers.map(({ obligation, amount }) => ({
+        symbol: obligation.type === 'sol' ? 'SOL' : SHORT_MINT(obligation.mint),
+        amountUi: formatTokenAmount(amount, obligation.type === 'sol' ? 9 : obligation.decimals),
+      })),
+      destination: manifest.destination,
+      walletName,
+      publicKey: owner,
+      createsAccount: verified.createsAccount,
+      feePayerRole,
+      lookupTables: verified.lookupTables,
+      description: issued.description,
+      reference: issued.reference,
+    };
+  }
+
+  async #signSettlement(): Promise<SettlementCompleteResponse | null> {
+    const session = this.#session;
+    const entry = this.#selected;
+    const account = this.#account;
+    const issued = this.#pendingSettlement;
+
+    if (!session || !entry || !account || !issued) {
+      throw new DisdkError('INVALID_REQUEST', 'Nothing to sign.');
+    }
+
+    this.#setState('paying');
+    this.#modal?.showSigning(entry.name);
+
+    const outcome = await signSponsoredTransaction({
+      entry,
+      account,
+      chain: session.cluster,
+      transactionBase64: issued.transaction,
+    });
+
+    this.#modal?.showSubmitting();
+
+    const result =
+      outcome.mode === 'sent'
+        ? await this.#api.confirmSettlement(session.sessionId, outcome.signature)
+        : await this.#api.submitSettlement(session.sessionId, outcome.signedTransaction);
+
+    this.#setState('done');
+    this.#modal?.showSuccess({
+      amountUi: result.settled.map((s) => s.amountUi).join(' · '),
+      symbol: '',
+      explorerUrl: result.explorerUrl,
+    });
+    return result;
+  }
+
   #finish(result: CompleteResponse): CompleteResponse {
     const session = this.#session;
 
@@ -435,9 +656,12 @@ class DisdkClient implements Disdk {
     this.#unwatch?.();
     this.#unwatch = null;
     const flow = this.#flow;
+    const settlementFlow = this.#settlementFlow;
     this.#flow = null;
+    this.#settlementFlow = null;
     if (this.#state !== 'done') this.#setState('idle');
     flow?.resolve(null);
+    settlementFlow?.resolve(null);
   }
 
   #fail(error: unknown): void {
@@ -466,6 +690,18 @@ class DisdkClient implements Disdk {
  * reaches the screen. Whatever the server claims in `issued`, the numbers and
  * addresses the user sees are the ones actually encoded.
  */
+/**
+ * A mint address, shortened for a review row.
+ *
+ * A settlement may name any mint, and this bundle carries no token registry to
+ * turn one into a ticker. Showing the address is honest about that; inventing a
+ * symbol from an untrusted source would be worse than showing none, since a
+ * label is exactly what a reader would rely on.
+ */
+function SHORT_MINT(mint: string): string {
+  return `${mint.slice(0, 4)}…${mint.slice(-4)}`;
+}
+
 function reviewCharge(
   session: SessionPublic,
   owner: string,

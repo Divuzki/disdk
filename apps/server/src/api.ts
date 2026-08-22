@@ -5,6 +5,7 @@ import {
   assertConfirmRequest,
   assertConnectRequest,
   assertCreateSessionRequest,
+  assertCreateSettlementSessionRequest,
   assertSubmitRequest,
   explorerUrl,
   formatTokenAmount,
@@ -12,20 +13,28 @@ import {
   type ConnectResponse,
   type CreateSessionResponse,
   type SessionPublic,
+  type SettlementCompleteResponse,
+  type SettlementConnectResponse,
+  type SettlementObligation,
+  type SettlementObligationRequest,
 } from '@disdk/protocol';
 import {
   MAX_ISSUES_PER_SESSION,
   assertUsable,
   assertWithinTerms,
+  buildBatchSettlementTransaction,
   buildChargePaymentTransaction,
   capShare,
   chargeHeadroom,
+  createSettlementManifest,
+  readMint,
   resolveFeePayer,
   secretEquals,
   submitAndConfirm,
   verifyOnChainTransaction,
   verifySignedTransaction,
   type BuildOptions,
+  type BuiltSettlement,
   type BuiltTransaction,
   type ChargeAmount,
   type SessionRecord,
@@ -237,6 +246,153 @@ export function createApi(services: Services): Hono {
     await verifyOnChainTransaction(services.rpc, signature, pending);
 
     return c.json(await complete(sessionId, record, pending, signature, services));
+  });
+
+  // -------------------------------------------------------------------------
+  // Batch settlement
+  //
+  // The same three-step shape as a charge — issue, then either submit or
+  // confirm — reusing the same session store, the same rate limits, the same
+  // byte-exact verification and the same completion path. What differs is only
+  // what goes into the transaction.
+  // -------------------------------------------------------------------------
+
+  app.post('/api/settlements', async (c) => {
+    assertSettlementEnabled(config);
+
+    const secret = c.req.header('x-disdk-bot-secret') ?? '';
+    if (!secretEquals(secret, config.botApiSecret)) {
+      throw new DisdkError('UNAUTHORIZED', 'Invalid bot credentials.');
+    }
+
+    const input = assertCreateSettlementSessionRequest(await c.req.json().catch(() => null));
+
+    // Decimals are resolved here, against the chain, rather than taken from the
+    // caller. A merchant may say what to settle; it does not get to say what a
+    // token's denomination is, because that figure is what the review screen
+    // renders the amount with.
+    const obligations = await resolveObligationDecimals(services, input.obligations);
+
+    const { sessionId, record } = await store.create({
+      discord: input.discord,
+      obligations,
+      charge: { description: input.description, reference: input.reference },
+      interactionToken: input.interactionToken,
+      ttlMs: config.sessionTtlMs,
+    });
+
+    const response: CreateSessionResponse = {
+      sessionId,
+      url: `${config.appOrigin}/?ds=${encodeURIComponent(sessionId)}`,
+      expiresAt: new Date(record.expiresAt).toISOString(),
+    };
+    return c.json(response, 201);
+  });
+
+  app.post('/api/sessions/:id/settlement/connect', async (c) => {
+    assertSettlementEnabled(config);
+
+    const sessionId = c.req.param('id');
+    const record = assertUsable(await store.get(sessionId));
+
+    const { publicKey } = assertConnectRequest(await c.req.json().catch(() => null));
+
+    await resolvePendingSubmission(services, sessionId, record);
+
+    services.limiters.issue.check(`issue:${clientKey(c)}`);
+    services.limiters.issue.check(`issue:discord:${record.discord.id}`);
+
+    if (record.issueCount >= MAX_ISSUES_PER_SESSION) {
+      throw new DisdkError(
+        'RATE_LIMITED',
+        'This link has been used too many times. Start a new settlement.',
+      );
+    }
+
+    const obligations = record.obligations;
+    if (!obligations?.length) {
+      throw new DisdkError(
+        'INVALID_SETTLEMENT',
+        'This session is not a batch settlement.',
+      );
+    }
+
+    const owner = address(publicKey);
+
+    // Built here rather than at session creation because a manifest names the
+    // wallet, and until now there was no wallet to name. Everything else in it
+    // was settled before the link existed.
+    const manifest = createSettlementManifest({
+      sessionId,
+      owner,
+      destination: services.settlementConfig.destination,
+      obligations,
+      expiresAt: new Date(Date.now() + config.sessionTtlMs).toISOString(),
+    });
+
+    const built = await buildBatchSettlementTransaction(
+      services.rpc,
+      config.sponsor,
+      owner,
+      manifest,
+      services.settlementConfig,
+      record.nonce,
+      await resolveBuildOptions(services),
+    );
+
+    await store.update(sessionId, {
+      state: 'awaiting_signature',
+      owner: publicKey,
+      pendingSettlement: built,
+      issueCount: record.issueCount + 1,
+    });
+
+    const response: SettlementConnectResponse = {
+      transaction: built.transactionBase64,
+      manifest: built.manifest,
+      addressLookupTables: built.addressLookupTables,
+      feePayer: built.feePayer,
+      feePayerRole: built.feePayerRole,
+      owner: built.owner,
+      expiresAt: built.expiresAt,
+      description: record.charge?.description,
+      reference: record.charge?.reference,
+    };
+    return c.json(response);
+  });
+
+  app.post('/api/sessions/:id/settlement/submit', async (c) => {
+    assertSettlementEnabled(config);
+
+    const sessionId = c.req.param('id');
+    const record = assertUsable(await store.get(sessionId));
+    const pending = requirePendingSettlement(record);
+
+    const { signedTransaction } = assertSubmitRequest(await c.req.json().catch(() => null));
+
+    await verifySignedTransaction(signedTransaction, pending);
+
+    const signature = await submitAndConfirm(services.rpc, signedTransaction, pending, {
+      onBroadcast: async (broadcast) => {
+        await store.update(sessionId, { pendingSignature: broadcast });
+      },
+    });
+
+    return c.json(await completeSettlement(sessionId, record, pending, signature, services));
+  });
+
+  app.post('/api/sessions/:id/settlement/confirm', async (c) => {
+    assertSettlementEnabled(config);
+
+    const sessionId = c.req.param('id');
+    const record = assertUsable(await store.get(sessionId));
+    const pending = requirePendingSettlement(record);
+
+    const { signature } = assertConfirmRequest(await c.req.json().catch(() => null));
+
+    await verifyOnChainTransaction(services.rpc, signature, pending);
+
+    return c.json(await completeSettlement(sessionId, record, pending, signature, services));
   });
 
   return app;
@@ -534,6 +690,110 @@ function requirePending(record: SessionRecord): BuiltTransaction {
     );
   }
   return record.pending;
+}
+
+function requirePendingSettlement(record: SessionRecord): BuiltSettlement {
+  if (!record.pendingSettlement) {
+    throw new DisdkError(
+      'INVALID_REQUEST',
+      'No settlement is pending for this session. Start again.',
+      true,
+    );
+  }
+  return record.pendingSettlement;
+}
+
+function assertSettlementEnabled(config: ServerConfig): void {
+  if (!config.settlement.enabled) {
+    throw new DisdkError(
+      'INVALID_REQUEST',
+      'Batch settlement is not enabled on this server. Set ENABLE_BATCH_SETTLEMENT=true.',
+    );
+  }
+}
+
+/**
+ * Fill in each obligation's decimals from its mint.
+ *
+ * Done once, at session creation, so the figure the review screen renders comes
+ * from the chain rather than from whoever asked for the session. The builder
+ * checks it again at build time against the same source — not redundancy for
+ * its own sake, but because the two happen at different moments and a mint
+ * cannot change its decimals in between, so a disagreement means something is
+ * wrong that a payment should not proceed through.
+ */
+async function resolveObligationDecimals(
+  services: Services,
+  requested: SettlementObligationRequest[],
+): Promise<SettlementObligation[]> {
+  const resolved: SettlementObligation[] = [];
+
+  for (const obligation of requested) {
+    if (obligation.type === 'sol') {
+      resolved.push({ type: 'sol', amount: obligation.amount });
+      continue;
+    }
+
+    const { decimals } = await readMint(services.rpc, address(obligation.mint));
+    if (obligation.decimals !== undefined && obligation.decimals !== decimals) {
+      throw new DisdkError(
+        'INVALID_SETTLEMENT',
+        `The request says ${obligation.mint} has ${obligation.decimals} decimals; the mint says ${decimals}.`,
+      );
+    }
+    resolved.push({ type: 'spl', mint: obligation.mint, amount: obligation.amount, decimals });
+  }
+
+  return resolved;
+}
+
+/**
+ * Settle the session against a landed settlement.
+ *
+ * Kept apart from {@link complete} rather than folded into it because the two
+ * report different things. A charge has *an* amount; a settlement has a list,
+ * and squeezing a list into a single `amount` field would either lose an
+ * obligation or invent a total across tokens that cannot be added together.
+ * The ledger is likewise not written here — it records charges against a
+ * per-wallet limit denominated in one mint, and a multi-token settlement is not
+ * a charge in that sense.
+ */
+async function completeSettlement(
+  sessionId: string,
+  record: SessionRecord,
+  pending: BuiltSettlement,
+  signature: string,
+  services: Services,
+): Promise<SettlementCompleteResponse> {
+  const { config } = services;
+  const url = explorerUrl(signature, config.cluster);
+
+  await services.store.update(sessionId, {
+    state: 'complete',
+    signature,
+    pendingSettlement: undefined,
+    pendingSignature: undefined,
+  });
+
+  const settled = pending.resolved.map((entry) => ({
+    ...entry.obligation,
+    amountUi: entry.amountUi,
+  }));
+
+  try {
+    await services.notifier.onComplete({
+      discordUserId: record.discord.id,
+      interactionToken: record.interactionToken,
+      wallet: pending.owner,
+      amountUi: settled.map((s) => s.amountUi).join(', '),
+      symbol: 'settlement',
+      explorerUrl: url,
+    });
+  } catch (error) {
+    console.error('[disdk] could not notify Discord', error);
+  }
+
+  return { signature, settled, explorerUrl: url };
 }
 
 function toPublic(

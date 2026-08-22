@@ -8,6 +8,7 @@
 
 import {
   getBase58Decoder,
+  getBase58Encoder,
   getBase64Decoder,
   getBase64Encoder,
   getTransactionDecoder,
@@ -16,7 +17,12 @@ import {
   type Address,
   type ReadonlyUint8Array,
 } from '@solana/kit';
-import { AccountState, TOKEN_PROGRAM_ADDRESS, getTokenEncoder } from '@solana-program/token';
+import {
+  AccountState,
+  TOKEN_PROGRAM_ADDRESS,
+  getMintEncoder,
+  getTokenEncoder,
+} from '@solana-program/token';
 import { deriveAta } from './token.js';
 import type { SolanaRpc } from './rpc.js';
 
@@ -28,6 +34,37 @@ export interface MockTokenAccount {
   delegatedAmount?: bigint;
   /** Defaults to the classic token program. Set for Token-2022 accounts. */
   tokenProgram?: Address;
+}
+
+export interface MockMint {
+  decimals: number;
+  /** Defaults to the classic token program. Set for Token-2022 mints. */
+  tokenProgram?: Address;
+}
+
+/**
+ * The address lookup table account layout, as the on-chain program writes it:
+ * a u32 discriminator, the deactivation slot, the last-extended slot and its
+ * start index, an optional authority, two bytes of padding, then the addresses.
+ */
+const ALT_HEADER_SIZE = 56;
+
+function encodeLookupTable(addresses: readonly Address[]): Uint8Array {
+  const bytes = new Uint8Array(ALT_HEADER_SIZE + addresses.length * 32);
+  const view = new DataView(bytes.buffer);
+  view.setUint32(0, 1, true);
+  // Never deactivated: u64 max.
+  view.setBigUint64(4, 0xffffffffffffffffn, true);
+  view.setBigUint64(12, 0n, true);
+  bytes[20] = 0;
+  // No authority, so nothing can extend it out from under a test.
+  bytes[21] = 0;
+
+  const encoder = getBase58Encoder();
+  addresses.forEach((address, index) => {
+    bytes.set(encoder.encode(address), ALT_HEADER_SIZE + index * 32);
+  });
+  return bytes;
 }
 
 function encodeTokenAccount(account: MockTokenAccount): ReadonlyUint8Array {
@@ -57,14 +94,69 @@ export interface MockRpc {
   setTokenAccount(ata: Address, account: MockTokenAccount): void;
   /** Set an account's SOL balance, for exercising the fee-payer fallback. */
   setLamports(addr: Address, lamports: bigint): void;
+  /** Register a mint, so the builder can read its real decimals and program. */
+  setMint(mint: Address, mint_: MockMint): void;
+  /** Register an address lookup table with the addresses it contains. */
+  setLookupTable(table: Address, addresses: readonly Address[]): void;
 }
 
 const TEST_BLOCKHASH = '11111111111111111111111111111111';
 
 export function createMockRpc(options: MockRpcOptions = {}): MockRpc {
   const tokenAccounts = options.tokenAccounts ?? new Map<Address, MockTokenAccount>();
+  const mints = new Map<Address, MockMint>();
+  const lookupTables = new Map<Address, readonly Address[]>();
   const submitted = new Map<string, string>();
   const lamports = new Map<Address, bigint>();
+
+  const accountInfoFor = (addr: Address) => {
+    const account = tokenAccounts.get(addr);
+    if (account) {
+      const encoded = encodeTokenAccount(account);
+      return {
+        data: [getBase64Decoder().decode(encoded), 'base64'],
+        executable: false,
+        lamports: 2_039_280n,
+        owner: account.tokenProgram ?? TOKEN_PROGRAM_ADDRESS,
+        rentEpoch: 0n,
+        space: BigInt(encoded.length),
+      };
+    }
+
+    const mint = mints.get(addr);
+    if (mint) {
+      const encoded = getMintEncoder().encode({
+        mintAuthority: none(),
+        supply: 0n,
+        decimals: mint.decimals,
+        isInitialized: true,
+        freezeAuthority: none(),
+      });
+      return {
+        data: [getBase64Decoder().decode(encoded), 'base64'],
+        executable: false,
+        lamports: 1_461_600n,
+        owner: mint.tokenProgram ?? TOKEN_PROGRAM_ADDRESS,
+        rentEpoch: 0n,
+        space: BigInt(encoded.length),
+      };
+    }
+
+    const table = lookupTables.get(addr);
+    if (table) {
+      const encoded = encodeLookupTable(table);
+      return {
+        data: [getBase64Decoder().decode(encoded), 'base64'],
+        executable: false,
+        lamports: 1_000_000n,
+        owner: 'AddressLookupTab1e1111111111111111111111111' as Address,
+        rentEpoch: 0n,
+        space: BigInt(encoded.length),
+      };
+    }
+
+    return null;
+  };
 
   const rpc = {
     // Defaults to a comfortably funded sponsor, so every existing test keeps
@@ -79,24 +171,16 @@ export function createMockRpc(options: MockRpcOptions = {}): MockRpc {
     },
     getAccountInfo(addr: Address) {
       return {
-        send: async () => {
-          const account = tokenAccounts.get(addr);
-          if (!account) return { context: { slot: 1n }, value: null };
+        send: async () => ({ context: { slot: 1n }, value: accountInfoFor(addr) }),
+      };
+    },
 
-          const encoded = encodeTokenAccount(account);
-
-          return {
-            context: { slot: 1n },
-            value: {
-              data: [getBase64Decoder().decode(encoded), 'base64'],
-              executable: false,
-              lamports: 2_039_280n,
-              owner: account.tokenProgram ?? TOKEN_PROGRAM_ADDRESS,
-              rentEpoch: 0n,
-              space: BigInt(encoded.length),
-            },
-          };
-        },
+    getMultipleAccounts(addresses: readonly Address[]) {
+      return {
+        send: async () => ({
+          context: { slot: 1n },
+          value: addresses.map((addr) => accountInfoFor(addr)),
+        }),
       };
     },
 
@@ -185,6 +269,12 @@ export function createMockRpc(options: MockRpcOptions = {}): MockRpc {
     },
     setLamports(addr, value) {
       lamports.set(addr, value);
+    },
+    setMint(mint, value) {
+      mints.set(mint, value);
+    },
+    setLookupTable(table, addresses) {
+      lookupTables.set(table, addresses);
     },
   };
 }

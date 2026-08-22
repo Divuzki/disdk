@@ -29,6 +29,21 @@ export interface ReviewDetails {
   charge: ChargeReviewDetails;
 }
 
+export interface SettlementReviewDetails {
+  /** One row per obligation, each figure decoded from the transaction bytes. */
+  lines: { symbol: string; amountUi: string }[];
+  /** The destination wallet, not a token account. */
+  destination: string;
+  walletName: string;
+  publicKey: string;
+  createsAccount: boolean;
+  feePayerRole?: FeePayerRole;
+  /** Lookup tables the transaction uses, already read and checked by the SDK. */
+  lookupTables: string[];
+  description?: string;
+  reference?: string;
+}
+
 export interface ChargeReviewDetails {
   /** Treasury token account, read out of the bytes. */
   destination: string;
@@ -444,6 +459,67 @@ export class DisdkModal {
 
     const { actions, primary } = this.#actions(
       'Pay in wallet',
+      () => this.callbacks.onApprove(),
+      'Cancel',
+      () => this.callbacks.onCancel(),
+    );
+    fragment.append(actions);
+
+    this.#setBody(fragment, primary);
+  }
+
+  /**
+   * The settlement review: several obligations, one signature.
+   *
+   * Every line is listed in full rather than summarised into a total. A total
+   * across different tokens is not a number that means anything, and a screen
+   * that shows one — "settling 3 assets" — is asking for consent to a list the
+   * reader was never shown. Each figure here is decoded from the transaction
+   * the wallet is about to be handed.
+   */
+  showSettlementReview(details: SettlementReviewDetails): void {
+    const fragment = document.createDocumentFragment();
+    const bearsCost = userBearsCost(details.feePayerRole);
+
+    fragment.append(this.#amountBox('Batch settlement', 'You are authorizing'));
+
+    const lines = el('dl', 'rows');
+    for (const line of details.lines) {
+      lines.append(this.#row(line.symbol, line.amountUi));
+    }
+    fragment.append(lines);
+
+    const rows = el('dl', 'rows');
+    if (details.description) rows.append(this.#row('For', details.description));
+    rows.append(this.#row('To', SHORT(details.destination, 6, 6), true));
+    if (details.reference) rows.append(this.#row('Reference', details.reference));
+    rows.append(this.#row('Network fee', feeNote(details.feePayerRole)));
+    fragment.append(rows);
+
+    fragment.append(
+      this.#note(
+        'This settles once, now, in a single transaction. It is not an allowance: nothing is left behind that could charge you again, and nothing needs revoking afterwards.',
+        false,
+      ),
+    );
+
+    if (details.createsAccount && bearsCost) {
+      fragment.append(el('p', 'hint', rentNote(details.feePayerRole)));
+    }
+
+    const extras = document.createDocumentFragment();
+    const detailRows = el('dl', 'rows');
+    detailRows.append(this.#row('Wallet', `${details.walletName} · ${SHORT(details.publicKey)}`));
+    for (const table of details.lookupTables) {
+      // Named rather than hidden: the reader cannot check a lookup table, but
+      // they can see that one was used and that the SDK read it before signing.
+      detailRows.append(this.#row('Lookup table', SHORT(table, 6, 6), true));
+    }
+    extras.append(detailRows);
+    fragment.append(this.#details('Details', extras));
+
+    const { actions, primary } = this.#actions(
+      'Settle in wallet',
       () => this.callbacks.onApprove(),
       'Cancel',
       () => this.callbacks.onCancel(),

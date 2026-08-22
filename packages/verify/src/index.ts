@@ -1,18 +1,39 @@
 export {
   deriveAta,
+  readMint,
   readTokenAccount,
   TOKEN_2022_PROGRAM_ADDRESS,
   TOKEN_PROGRAMS,
 } from './token.js';
-export type { TokenAccountView } from './token.js';
+export type { MintView, TokenAccountView } from './token.js';
 
 export {
   buildChargePaymentTransaction,
   resolveFeePayer,
   LAMPORTS_PER_SIGNATURE,
+  MAX_TRANSACTION_BYTES,
   TOKEN_ACCOUNT_RENT_LAMPORTS,
 } from './build.js';
-export type { BuildOptions, BuiltTransaction, ChargeSessionConfig } from './build.js';
+export type {
+  BuildOptions,
+  BuiltTransaction,
+  ChargeSessionConfig,
+  TransactionExpectation,
+} from './build.js';
+
+export {
+  buildBatchSettlementTransaction,
+  createSettlementManifest,
+  manifestHash,
+  SYSTEM_ACCOUNT_RENT_LAMPORTS,
+} from './settlement.js';
+export type {
+  BuiltSettlement,
+  ResolvedObligation,
+  SettlementConfig,
+} from './settlement.js';
+
+export { AltRegistry, parseAltAddresses, resolveLookupTables, selectLookupTables } from './alt.js';
 
 export {
   resolveChargeAmount,

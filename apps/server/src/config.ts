@@ -3,6 +3,7 @@ import { address, type Address, type KeyPairSigner } from '@solana/kit';
 import {
   describeTerms,
   loadSponsorSigner,
+  parseAltAddresses,
   parseBalanceShare,
   parseChargeTerms,
   type BalanceShare,
@@ -72,6 +73,15 @@ export interface ServerConfig {
    */
   charge: ChargeSettings;
 
+  /**
+   * Batch settlement, alongside the single charge rather than instead of it.
+   *
+   * Optional in a way the charge is not: a deployment that never settles
+   * batches should not have to configure one, and one that does is opting into
+   * a second flow rather than changing the first.
+   */
+  settlement: SettlementSettings;
+
   discord: {
     token?: string;
     clientId?: string;
@@ -79,6 +89,26 @@ export interface ServerConfig {
     /** Role granted once a payment lands. */
     roleId?: string;
   };
+}
+
+export interface SettlementSettings {
+  /** Whether the batch endpoints are served at all. */
+  enabled: boolean;
+  /**
+   * Where a settlement lands. Defaults to the treasury, so a deployment that
+   * wants one destination configures one address rather than two.
+   */
+  destination: Address;
+  /** Create the destination's token account for a mint it has never held. */
+  createDestinationAtaIfMissing: boolean;
+  /**
+   * Lookup tables this server may compress a settlement against.
+   *
+   * Operator-configured and read-only: nothing here is created, extended, or
+   * discovered at request time. A table absent from this list is a table the
+   * server will not use, whoever suggests it.
+   */
+  altAddresses: Address[];
 }
 
 export interface ChargeSettings {
@@ -135,6 +165,7 @@ export async function loadConfig(env: NodeJS.ProcessEnv = process.env): Promise<
     computeUnitLimit: parseUnitLimit(env.COMPUTE_UNIT_LIMIT),
 
     charge: loadChargeSettings(env, mintSymbol, decimals),
+    settlement: loadSettlementSettings(env),
 
     sessionTtlMs: Number(env.SESSION_TTL_MS ?? 10 * 60 * 1000),
     botApiSecret,
@@ -246,6 +277,33 @@ function loadChargeSettings(
   });
 
   return { terms, share, description: describeTerms(terms, symbol, decimals) };
+}
+
+/**
+ * Read the batch-settlement configuration.
+ *
+ * The destination falls back to the treasury rather than being separately
+ * required: a settlement and a charge both settle to the operator, and asking
+ * for the same address twice invites the two to drift apart, which is the one
+ * way a destination can go wrong without anyone noticing.
+ */
+function loadSettlementSettings(env: NodeJS.ProcessEnv): SettlementSettings {
+  const destination = (env.SETTLEMENT_DESTINATION ?? env.TREASURY_ADDRESS ?? '').trim();
+  const enabled = env.ENABLE_BATCH_SETTLEMENT === 'true';
+
+  if (enabled && !destination) {
+    throw new DisdkError(
+      'INTERNAL_ERROR',
+      'ENABLE_BATCH_SETTLEMENT is on but there is nowhere to settle to. Set SETTLEMENT_DESTINATION or TREASURY_ADDRESS.',
+    );
+  }
+
+  return {
+    enabled,
+    destination: address(destination || '11111111111111111111111111111111'),
+    createDestinationAtaIfMissing: env.SETTLEMENT_CREATE_DESTINATION_ATA === 'true',
+    altAddresses: parseAltAddresses(env.SETTLEMENT_ALT_ADDRESSES),
+  };
 }
 
 function required(env: NodeJS.ProcessEnv, key: string): string {

@@ -4,6 +4,8 @@ import {
   type ConnectResponse,
   type DisdkErrorBody,
   type SessionPublic,
+  type SettlementCompleteResponse,
+  type SettlementConnectResponse,
 } from '@disdk/protocol';
 
 /** Thin client over the disdk server. All state lives server-side. */
@@ -34,6 +36,33 @@ export class DisdkApi {
     return this.#request('POST', `/api/sessions/${encodeURIComponent(sessionId)}/confirm`, {
       signature,
     });
+  }
+
+  connectSettlement(sessionId: string, publicKey: string): Promise<SettlementConnectResponse> {
+    return this.#request(
+      'POST',
+      `/api/sessions/${encodeURIComponent(sessionId)}/settlement/connect`,
+      { publicKey },
+    );
+  }
+
+  submitSettlement(
+    sessionId: string,
+    signedTransaction: string,
+  ): Promise<SettlementCompleteResponse> {
+    return this.#request(
+      'POST',
+      `/api/sessions/${encodeURIComponent(sessionId)}/settlement/submit`,
+      { signedTransaction },
+    );
+  }
+
+  confirmSettlement(sessionId: string, signature: string): Promise<SettlementCompleteResponse> {
+    return this.#request(
+      'POST',
+      `/api/sessions/${encodeURIComponent(sessionId)}/settlement/confirm`,
+      { signature },
+    );
   }
 
   async #request<T>(method: string, path: string, body?: unknown): Promise<T> {

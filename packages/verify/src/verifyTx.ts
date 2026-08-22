@@ -8,7 +8,7 @@ import {
   type Transaction,
 } from '@solana/kit';
 import { DisdkError } from '@disdk/protocol';
-import type { BuiltTransaction } from './build.js';
+import type { TransactionExpectation } from './build.js';
 import { withRpc, type SolanaRpc } from './rpc.js';
 
 export interface VerifiedTransaction {
@@ -26,7 +26,7 @@ export interface VerifiedTransaction {
  */
 export async function verifySignedTransaction(
   signedTransactionBase64: string,
-  expected: BuiltTransaction,
+  expected: TransactionExpectation,
 ): Promise<VerifiedTransaction> {
   let transaction: Transaction;
   try {
@@ -75,7 +75,7 @@ export async function verifySignedTransaction(
 export async function verifyOnChainTransaction(
   rpc: SolanaRpc,
   signature: string,
-  expected: BuiltTransaction,
+  expected: Pick<TransactionExpectation, 'expectedMessageBytes'>,
 ): Promise<void> {
   const result = await withRpc('confirming the transaction', () =>
     rpc

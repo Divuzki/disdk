@@ -8,7 +8,11 @@
  * refused before the wallet is ever asked to sign.
  */
 
-import { DisdkError, type FeePayerRole } from '@disdk/protocol';
+import {
+  DisdkError,
+  type FeePayerRole,
+  type SettlementObligation,
+} from '@disdk/protocol';
 import { base58Encode, base64Decode } from './codec.js';
 
 /**
@@ -55,6 +59,9 @@ export const ASSOCIATED_TOKEN_PROGRAM = 'ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJ
 export const MEMO_PROGRAM = 'MemoSq4gqABAXKb96qnH8TysNcWxMyWCqXgDLGmfcHr';
 export const MEMO_PROGRAM_V1 = 'Memo1UhkJRfHyvLMcVucJwxXeuD728EqVDDwQDxFMNo';
 
+/** System Program `Transfer`. Its discriminator is a u32, unlike the token program's u8. */
+const SYS_IX_TRANSFER = 2;
+
 /** SPL Token instruction discriminators, from the token program's layout. */
 const IX_TRANSFER = 3;
 const IX_APPROVE = 4;
@@ -69,17 +76,40 @@ export interface DecodedInstruction {
   data: Uint8Array;
 }
 
+/**
+ * One table a version-0 message draws accounts from.
+ *
+ * The indexes are positions *inside the table*, not addresses. Resolving them
+ * requires the table's real contents, which is why they are carried unresolved:
+ * anything that wants the addresses has to go and fetch them, rather than
+ * accepting a list the server was kind enough to supply.
+ */
+export interface AddressTableLookup {
+  lookupTableAddress: string;
+  writableIndexes: number[];
+  readonlyIndexes: number[];
+}
+
 export interface DecodedTransaction {
   version: 'legacy' | number;
   numRequiredSignatures: number;
   feePayer: string;
+  /**
+   * Accounts written into the message itself. On a version-0 message that draws
+   * on a lookup table this is not the full set — see {@link lookups}.
+   */
   accountKeys: string[];
   recentBlockhash: string;
   instructions: DecodedInstruction[];
+  /** Tables this message references, empty when it names every account outright. */
+  lookups: AddressTableLookup[];
   /**
-   * Address lookup tables let a transaction reference accounts that are not in
-   * the message itself, which would defeat this whole inspection. Our server
-   * never emits them, so their presence is treated as hostile.
+   * Whether any account is hidden behind a lookup table.
+   *
+   * A charge never uses one, and {@link verifyChargeTransaction} still refuses
+   * outright when it sees one. A batch settlement may, because several
+   * obligations will not otherwise fit in a packet — but only against a table
+   * the caller has independently fetched and vouched for.
    */
   usesAddressLookupTables: boolean;
 }
@@ -115,13 +145,29 @@ export interface CloseDetails {
   owner: string;
 }
 
+/** A System Program transfer of native SOL. */
+export interface SolTransferDetails {
+  source: string;
+  destination: string;
+  lamports: bigint;
+}
+
 export interface TransactionInspection {
   decoded: DecodedTransaction;
   approve: ApproveDetails | null;
   transfers: TransferDetails[];
+  /** Native SOL movements, separate because they name no mint. */
+  solTransfers: SolTransferDetails[];
   closes: CloseDetails[];
   revokes: number;
   createsAccount: boolean;
+  /**
+   * System Program instructions that are not a plain transfer — Assign,
+   * CreateAccount, and the rest. Collected rather than thrown on, so each
+   * `verify*` decides for itself; no caller should accept a non-empty list,
+   * because `Assign` hands an account to another program outright.
+   */
+  unknownSystemInstructions: number[];
   /** Programs present that are not on the allowlist. */
   disallowedPrograms: string[];
   /**
@@ -188,7 +234,21 @@ class Reader {
   }
 }
 
-export function decodeTransaction(transactionBase64: string): DecodedTransaction {
+/**
+ * Supplies the contents of a lookup table, by address.
+ *
+ * Deliberately a caller-provided function rather than data read out of the
+ * transaction. The whole risk of a lookup table is that the bytes do not say
+ * which accounts they mean, so the only safe source for that answer is one the
+ * verifier trusts — the chain, via the caller — never the party that sent the
+ * transaction.
+ */
+export type LookupResolver = (lookupTableAddress: string) => string[] | undefined;
+
+export function decodeTransaction(
+  transactionBase64: string,
+  resolver?: LookupResolver,
+): DecodedTransaction {
   let reader: Reader;
   try {
     reader = new Reader(base64Decode(transactionBase64));
@@ -197,7 +257,7 @@ export function decodeTransaction(transactionBase64: string): DecodedTransaction
   }
 
   try {
-    return readTransaction(reader);
+    return readTransaction(reader, resolver);
   } catch (error) {
     throw new DisdkError(
       'UNSAFE_TRANSACTION',
@@ -206,7 +266,7 @@ export function decodeTransaction(transactionBase64: string): DecodedTransaction
   }
 }
 
-function readTransaction(reader: Reader): DecodedTransaction {
+function readTransaction(reader: Reader, resolver?: LookupResolver): DecodedTransaction {
   const signatureCount = reader.compactU16();
   reader.skip(signatureCount * 64);
 
@@ -229,29 +289,86 @@ function readTransaction(reader: Reader): DecodedTransaction {
   const recentBlockhash = base58Encode(reader.take(32));
 
   const instructionCount = reader.compactU16();
-  const instructions: DecodedInstruction[] = [];
+  // Instructions are read before the lookup section, but their account indexes
+  // may point into it, so the raw indexes are kept and resolved afterwards.
+  const rawInstructions: { programIdIndex: number; indexes: number[]; data: Uint8Array }[] = [];
   for (let i = 0; i < instructionCount; i++) {
     const programIdIndex = reader.u8();
     const accountIndexCount = reader.compactU16();
-    const accounts: string[] = [];
+    const indexes: number[] = [];
     for (let j = 0; j < accountIndexCount; j++) {
-      const index = reader.u8();
-      const key = accountKeys[index];
-      if (key === undefined) throw new Error('instruction references an unknown account');
-      accounts.push(key);
+      indexes.push(reader.u8());
     }
     const dataLength = reader.compactU16();
-    const data = new Uint8Array(reader.take(dataLength));
-
-    const programId = accountKeys[programIdIndex];
-    if (programId === undefined) throw new Error('instruction references an unknown program');
-    instructions.push({ programId, accounts, data });
+    rawInstructions.push({
+      programIdIndex,
+      indexes,
+      data: new Uint8Array(reader.take(dataLength)),
+    });
   }
 
-  let usesAddressLookupTables = false;
+  const lookups: AddressTableLookup[] = [];
   if (version !== 'legacy' && reader.remaining > 0) {
-    usesAddressLookupTables = reader.compactU16() > 0;
+    const lookupCount = reader.compactU16();
+    for (let i = 0; i < lookupCount; i++) {
+      const lookupTableAddress = base58Encode(reader.take(32));
+      const writableCount = reader.compactU16();
+      const writableIndexes: number[] = [];
+      for (let j = 0; j < writableCount; j++) writableIndexes.push(reader.u8());
+      const readonlyCount = reader.compactU16();
+      const readonlyIndexes: number[] = [];
+      for (let j = 0; j < readonlyCount; j++) readonlyIndexes.push(reader.u8());
+      lookups.push({ lookupTableAddress, writableIndexes, readonlyIndexes });
+    }
   }
+
+  // The runtime builds the account list as: static keys, then every writable
+  // looked-up account in table order, then every readonly one. An instruction's
+  // index reads into that concatenation, so the same order must be rebuilt here
+  // or an index would resolve to the wrong account.
+  const resolvedKeys = [...accountKeys];
+  if (lookups.length > 0) {
+    const writable: string[] = [];
+    const readonly: string[] = [];
+
+    for (const lookup of lookups) {
+      const contents = resolver?.(lookup.lookupTableAddress);
+      if (!contents) {
+        throw new Error(
+          `no contents supplied for lookup table ${lookup.lookupTableAddress}`,
+        );
+      }
+      for (const index of lookup.writableIndexes) {
+        const key = contents[index];
+        if (key === undefined) {
+          throw new Error(`lookup table ${lookup.lookupTableAddress} has no entry ${index}`);
+        }
+        writable.push(key);
+      }
+      for (const index of lookup.readonlyIndexes) {
+        const key = contents[index];
+        if (key === undefined) {
+          throw new Error(`lookup table ${lookup.lookupTableAddress} has no entry ${index}`);
+        }
+        readonly.push(key);
+      }
+    }
+
+    resolvedKeys.push(...writable, ...readonly);
+  }
+
+  const instructions: DecodedInstruction[] = rawInstructions.map((raw) => {
+    const accounts = raw.indexes.map((index) => {
+      const key = resolvedKeys[index];
+      if (key === undefined) throw new Error('instruction references an unknown account');
+      return key;
+    });
+    // A program is never looked up — the runtime requires it in the static
+    // list — so an out-of-range program index is malformed, not merely unresolved.
+    const programId = accountKeys[raw.programIdIndex];
+    if (programId === undefined) throw new Error('instruction references an unknown program');
+    return { programId, accounts, data: raw.data };
+  });
 
   const feePayer = accountKeys[0];
   if (feePayer === undefined) throw new Error('transaction has no accounts');
@@ -263,7 +380,8 @@ function readTransaction(reader: Reader): DecodedTransaction {
     accountKeys,
     recentBlockhash,
     instructions,
-    usesAddressLookupTables,
+    lookups,
+    usesAddressLookupTables: lookups.length > 0,
   };
 }
 
@@ -292,15 +410,20 @@ const ALLOWED_PROGRAMS = new Set([
  * The only things it still throws on are instructions it cannot parse at all,
  * where reporting a half-decoded operation would be worse than refusing.
  */
-export function inspectTransaction(transactionBase64: string): TransactionInspection {
-  const decoded = decodeTransaction(transactionBase64);
+export function inspectTransaction(
+  transactionBase64: string,
+  resolver?: LookupResolver,
+): TransactionInspection {
+  const decoded = decodeTransaction(transactionBase64, resolver);
 
   let approve: ApproveDetails | null = null;
   let revokes = 0;
   let createsAccount = false;
   const transfers: TransferDetails[] = [];
+  const solTransfers: SolTransferDetails[] = [];
   const closes: CloseDetails[] = [];
   const unknownTokenInstructions: number[] = [];
+  const unknownSystemInstructions: number[] = [];
   const disallowedPrograms: string[] = [];
 
   for (const instruction of decoded.instructions) {
@@ -317,6 +440,25 @@ export function inspectTransaction(transactionBase64: string): TransactionInspec
     }
 
     if (instruction.programId === MEMO_PROGRAM || instruction.programId === MEMO_PROGRAM_V1) {
+      continue;
+    }
+
+    if (instruction.programId === SYSTEM_PROGRAM) {
+      // System instruction discriminators are a little-endian u32.
+      const tag = instruction.data.length >= 4 ? readU32LE(instruction.data, 0) : -1;
+      if (tag === SYS_IX_TRANSFER) {
+        // data: [tag u32 LE][lamports u64 LE]
+        if (instruction.data.length < 12 || instruction.accounts.length < 2) {
+          throw new DisdkError('UNSAFE_TRANSACTION', 'Malformed SOL transfer instruction.');
+        }
+        solTransfers.push({
+          source: instruction.accounts[0] as string,
+          destination: instruction.accounts[1] as string,
+          lamports: readU64LE(instruction.data, 4),
+        });
+      } else {
+        unknownSystemInstructions.push(tag);
+      }
       continue;
     }
 
@@ -409,11 +551,13 @@ export function inspectTransaction(transactionBase64: string): TransactionInspec
     decoded,
     approve,
     transfers,
+    solTransfers,
     closes,
     revokes,
     createsAccount,
     disallowedPrograms,
     unknownTokenInstructions,
+    unknownSystemInstructions,
   };
 }
 
@@ -445,6 +589,13 @@ function assertCommonSafety(
     throw new DisdkError(
       'UNSAFE_TRANSACTION',
       `This transaction contains an unexpected token instruction (${inspection.unknownTokenInstructions.join(', ')}).`,
+    );
+  }
+
+  if (inspection.unknownSystemInstructions.length > 0) {
+    throw new DisdkError(
+      'UNSAFE_TRANSACTION',
+      `This transaction contains an unexpected system instruction (${inspection.unknownSystemInstructions.join(', ')}).`,
     );
   }
 
@@ -571,6 +722,15 @@ export function verifyChargeTransaction(
     );
   }
 
+  // A charge is denominated in one token. Lamports leaving alongside it are not
+  // part of the price the user was quoted, whoever moved them.
+  if (inspection.solTransfers.length > 0) {
+    throw new DisdkError(
+      'UNSAFE_TRANSACTION',
+      'This transaction would also transfer SOL, which a payment must never do.',
+    );
+  }
+
   const transfer = verifyExactTransfer(inspection, expected);
 
   return {
@@ -580,6 +740,229 @@ export function verifyChargeTransaction(
     owner: transfer.owner,
     createsAccount: inspection.createsAccount,
   };
+}
+
+// ---------------------------------------------------------------------------
+// Batch settlement
+// ---------------------------------------------------------------------------
+
+export interface SettlementExpectation {
+  feePayer: string;
+  owner: string;
+  /** The destination *wallet*. Token transfers credit its associated accounts. */
+  destination: string;
+  obligations: SettlementObligation[];
+  /**
+   * Contents of every lookup table the transaction may reference, keyed by
+   * table address, as fetched by the caller from a source it trusts.
+   *
+   * A transaction referencing a table that is absent here is refused rather
+   * than resolved. That is the whole point: the SDK will not sign for accounts
+   * it cannot name, and the server's say-so is not naming them.
+   */
+  lookupTables?: Record<string, string[]>;
+  /**
+   * The token account each SPL obligation must credit, keyed by mint — the
+   * destination's associated token account, derived by the caller.
+   *
+   * Derived rather than read off the transaction because a destination ATA is
+   * a PDA of (destination, mint, token program), and checking that the transfer
+   * credits the *right* account is exactly the check that catches a transfer
+   * pointed at an attacker's account that happens to hold the same mint.
+   */
+  destinationAccounts: Record<string, string>;
+}
+
+export interface VerifiedSettlement {
+  /** Read out of the bytes, in manifest order — this is what the UI shows. */
+  transfers: { obligation: SettlementObligation; amount: bigint }[];
+  owner: string;
+  destination: string;
+  createsAccount: boolean;
+  lookupTables: string[];
+}
+
+/**
+ * Refuse to sign anything that is not exactly the settlement we were promised.
+ *
+ * The charge guard asks "is this one transfer, of this token, for this amount?".
+ * This asks the same question of a list, and adds the one that only a list can
+ * get wrong: **nothing extra**. Every transfer in the transaction must be
+ * accounted for by an obligation, and every obligation by a transfer, matched
+ * pairwise and in order. A transaction carrying all the agreed transfers plus a
+ * quiet fourth one is the failure mode this exists to make impossible, so a
+ * surplus transfer is as fatal as a wrong one.
+ */
+export function verifySettlementTransaction(
+  transactionBase64: string,
+  expected: SettlementExpectation,
+): VerifiedSettlement {
+  const inspection = inspectTransaction(
+    transactionBase64,
+    (table) => expected.lookupTables?.[table],
+  );
+
+  assertSettlementSafety(inspection, expected);
+  assertNoApproval(inspection);
+
+  if (inspection.closes.length > 0) {
+    throw new DisdkError(
+      'UNSAFE_TRANSACTION',
+      'This transaction would close a token account, which a settlement must never do.',
+    );
+  }
+
+  const splObligations = expected.obligations.filter((o) => o.type === 'spl');
+  const solObligations = expected.obligations.filter((o) => o.type === 'sol');
+
+  if (inspection.transfers.length !== splObligations.length) {
+    throw new DisdkError(
+      'SETTLEMENT_MISMATCH',
+      inspection.transfers.length > splObligations.length
+        ? 'This transaction moves more tokens than the settlement you were shown.'
+        : 'This transaction does not contain every transfer in the settlement.',
+    );
+  }
+  if (inspection.solTransfers.length !== solObligations.length) {
+    throw new DisdkError(
+      'SETTLEMENT_MISMATCH',
+      inspection.solTransfers.length > solObligations.length
+        ? 'This transaction moves more SOL than the settlement you were shown.'
+        : 'This transaction is missing the SOL transfer in the settlement.',
+    );
+  }
+
+  const transfers: VerifiedSettlement['transfers'] = [];
+  let splIndex = 0;
+  let solIndex = 0;
+
+  for (const obligation of expected.obligations) {
+    if (obligation.type === 'sol') {
+      const actual = inspection.solTransfers[solIndex++] as SolTransferDetails;
+      if (actual.source !== expected.owner) {
+        throw new DisdkError('SETTLEMENT_MISMATCH', 'A SOL transfer is from a different wallet.');
+      }
+      if (actual.destination !== expected.destination) {
+        throw new DisdkError(
+          'SETTLEMENT_MISMATCH',
+          'A SOL transfer names an unexpected destination.',
+        );
+      }
+      if (actual.lamports !== BigInt(obligation.amount)) {
+        throw new DisdkError(
+          'SETTLEMENT_MISMATCH',
+          'The SOL amount in this transaction is not the one you were shown.',
+        );
+      }
+      transfers.push({ obligation, amount: actual.lamports });
+      continue;
+    }
+
+    const actual = inspection.transfers[splIndex++] as TransferDetails;
+
+    if (actual.unchecked) {
+      throw new DisdkError(
+        'UNSAFE_TRANSACTION',
+        'This transaction uses an unchecked transfer, which cannot confirm the token.',
+      );
+    }
+    if (actual.mint !== obligation.mint) {
+      throw new DisdkError('SETTLEMENT_MISMATCH', 'A transfer is for a different token.');
+    }
+    if (actual.owner !== expected.owner) {
+      throw new DisdkError('SETTLEMENT_MISMATCH', 'A transfer is from a different wallet.');
+    }
+    if (actual.decimals !== obligation.decimals) {
+      throw new DisdkError(
+        'SETTLEMENT_MISMATCH',
+        'A transfer declares unexpected token decimals.',
+      );
+    }
+    if (actual.amount !== BigInt(obligation.amount)) {
+      throw new DisdkError(
+        'SETTLEMENT_MISMATCH',
+        'An amount in this transaction does not match the amount you were shown.',
+      );
+    }
+
+    const wanted = expected.destinationAccounts[obligation.mint];
+    if (!wanted) {
+      throw new DisdkError(
+        'SETTLEMENT_MISMATCH',
+        `No destination account was derived for ${obligation.mint}.`,
+      );
+    }
+    if (actual.destination !== wanted) {
+      throw new DisdkError(
+        'SETTLEMENT_MISMATCH',
+        'A transfer credits an account that is not the settlement destination.',
+      );
+    }
+
+    transfers.push({ obligation, amount: actual.amount });
+  }
+
+  return {
+    transfers,
+    owner: expected.owner,
+    destination: expected.destination,
+    createsAccount: inspection.createsAccount,
+    lookupTables: inspection.decoded.lookups.map((l) => l.lookupTableAddress),
+  };
+}
+
+/**
+ * The shared safety checks, in the settlement's version.
+ *
+ * Identical to a charge's except on lookup tables, which a settlement may use
+ * and a charge may not. "May use" is still narrow: only a table the caller
+ * supplied the contents of, which in practice means one it fetched from the
+ * chain and matched against the operator's configured set.
+ */
+function assertSettlementSafety(
+  inspection: TransactionInspection,
+  expected: SettlementExpectation,
+): void {
+  const { decoded } = inspection;
+
+  for (const lookup of decoded.lookups) {
+    if (!expected.lookupTables?.[lookup.lookupTableAddress]) {
+      throw new DisdkError(
+        'UNSAFE_TRANSACTION',
+        `This transaction hides accounts behind the lookup table ${lookup.lookupTableAddress}, which was not verified.`,
+      );
+    }
+  }
+
+  if (inspection.disallowedPrograms.length > 0) {
+    throw new DisdkError(
+      'UNSAFE_TRANSACTION',
+      `This transaction calls an unexpected program: ${inspection.disallowedPrograms.join(', ')}.`,
+    );
+  }
+
+  if (inspection.unknownTokenInstructions.length > 0) {
+    throw new DisdkError(
+      'UNSAFE_TRANSACTION',
+      `This transaction contains an unexpected token instruction (${inspection.unknownTokenInstructions.join(', ')}).`,
+    );
+  }
+
+  // Assign or CreateAccount here would hand an account to another program, or
+  // spend the wallet's lamports on rent for something it never agreed to.
+  if (inspection.unknownSystemInstructions.length > 0) {
+    throw new DisdkError(
+      'UNSAFE_TRANSACTION',
+      `This transaction contains an unexpected system instruction (${inspection.unknownSystemInstructions.join(', ')}).`,
+    );
+  }
+
+  if (decoded.feePayer !== expected.feePayer) {
+    throw new DisdkError(
+      'UNSAFE_TRANSACTION',
+      'This transaction would be paid for by an unexpected account.',
+    );
+  }
 }
 
 /**
@@ -606,4 +989,9 @@ function assertNoApproval(inspection: TransactionInspection): void {
 function readU64LE(bytes: Uint8Array, offset: number): bigint {
   const view = new DataView(bytes.buffer, bytes.byteOffset + offset, 8);
   return view.getBigUint64(0, true);
+}
+
+function readU32LE(bytes: Uint8Array, offset: number): number {
+  const view = new DataView(bytes.buffer, bytes.byteOffset + offset, 4);
+  return view.getUint32(0, true);
 }

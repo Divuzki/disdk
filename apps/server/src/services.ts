@@ -1,10 +1,12 @@
 import {
+  AltRegistry,
   MemoryChargeLedger,
   MemorySessionStore,
   createRpc,
   type ChargeLedger,
   type ChargeSessionConfig,
   type SessionStore,
+  type SettlementConfig,
   type SolanaRpc,
 } from '@disdk/verify';
 import { RateLimiter } from './ratelimit.ts';
@@ -27,6 +29,8 @@ export interface Services {
   rpc: SolanaRpc;
   store: SessionStore;
   chargeConfig: ChargeSessionConfig;
+  /** How a batch settlement is built, mirroring `chargeConfig` for the charge. */
+  settlementConfig: SettlementConfig;
   /**
    * Where charges are remembered, so the period limits in `ChargeTerms` mean
    * something.
@@ -67,6 +71,13 @@ export function createServices(
       symbol: config.mintSymbol,
       treasury: config.charge.terms.treasury,
       createTreasuryAtaIfMissing: config.charge.terms.createTreasuryAtaIfMissing,
+    },
+    settlementConfig: {
+      destination: config.settlement.destination,
+      createDestinationAtaIfMissing: config.settlement.createDestinationAtaIfMissing,
+      // One registry for the process, so the tables are read once a minute
+      // rather than once a settlement.
+      altRegistry: new AltRegistry(config.settlement.altAddresses),
     },
     ledger,
     limiters: {

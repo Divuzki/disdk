@@ -1,5 +1,7 @@
 import {
+  AccountRole,
   appendTransactionMessageInstructions,
+  compressTransactionMessageUsingAddressLookupTables,
   createNoopSigner,
   createTransactionMessage,
   getBase64EncodedWireTransaction,
@@ -7,8 +9,12 @@ import {
   pipe,
   setTransactionMessageFeePayerSigner,
   setTransactionMessageLifetimeUsingBlockhash,
+  type AccountMeta,
+  type AccountSignerMeta,
   type Address,
+  type AddressesByLookupTableAddress,
   type Instruction,
+  type InstructionWithSigners,
   type TransactionSigner,
 } from '@solana/kit';
 import {
@@ -79,24 +85,36 @@ export interface ChargeSessionConfig {
   createTreasuryAtaIfMissing?: boolean;
 }
 
-export interface BuiltTransaction {
-  /** Base64 wire transaction, already carrying the sponsor's signature. */
-  transactionBase64: string;
+/**
+ * Everything needed to hold a client's returned transaction to account.
+ *
+ * Split out of {@link BuiltTransaction} so the verifier can be stated in terms
+ * of what it actually checks. A charge carries an amount and a token account; a
+ * batch settlement carries neither in the singular. Both compile to a message,
+ * and the message is the whole of what verification compares — so both satisfy
+ * this, and `verifySignedTransaction` needs no per-flow variant.
+ */
+export interface TransactionExpectation {
   /**
    * The exact compiled message the sponsor signed. Submission must check the
    * client's returned transaction against these bytes.
    */
   expectedMessageBytes: Uint8Array;
   owner: Address;
-  ata: Address;
   feePayer: Address;
   /** Which account `feePayer` is, so callers can report it without comparing keys. */
   feePayerRole: FeePayerRole;
+  lastValidBlockHeight: bigint;
+}
+
+export interface BuiltTransaction extends TransactionExpectation {
+  /** Base64 wire transaction, already carrying the sponsor's signature. */
+  transactionBase64: string;
+  ata: Address;
   amount: bigint;
   amountUi: string;
   balanceAtBuild: bigint;
   blockhash: string;
-  lastValidBlockHeight: bigint;
   expiresAt: string;
   /** Present once the charge instructions have been assembled. */
   charge?: {
@@ -285,6 +303,126 @@ export async function buildChargePaymentTransaction(
   };
 }
 
+/**
+ * Solana's maximum serialized transaction size, in bytes — one IPv6 MTU minus
+ * headers. A transaction over this is not merely expensive, it is unsendable,
+ * so it is measured rather than estimated.
+ */
+export const MAX_TRANSACTION_BYTES = 1232;
+
+/** A blockhash and the height past which it can no longer land. */
+export interface Lifetime {
+  blockhash: string;
+  lastValidBlockHeight: bigint;
+}
+
+export interface CompiledTransaction {
+  transactionBase64: string;
+  expectedMessageBytes: Uint8Array;
+  feePayer: Address;
+  feePayerRole: FeePayerRole;
+  /** Serialized wire size, so callers can judge it against {@link MAX_TRANSACTION_BYTES}. */
+  wireBytes: number;
+}
+
+/** Who signs for the fee, given the role the caller settled on. */
+export function resolvePayerSigner(
+  sponsor: TransactionSigner,
+  owner: Address,
+  options: BuildOptions,
+): { payer: TransactionSigner; feePayerRole: FeePayerRole } {
+  const feePayerRole = options.feePayerRole ?? 'sponsor';
+  // When the owner pays, the sponsor is not a signer at all: the owner already
+  // signs every flow here as the token authority, so the transaction goes from
+  // two signatures to one rather than gaining any.
+  return {
+    payer: feePayerRole === 'owner' ? createNoopSigner(owner) : sponsor,
+    feePayerRole,
+  };
+}
+
+/**
+ * Compile a version-0 message, sign what the server can sign, and measure it.
+ *
+ * The single place any flow in this package turns instructions into a
+ * transaction. A charge and a batch settlement differ in what they put in the
+ * list and in nothing else — the version, the ordering rule for ComputeBudget,
+ * the signing model, and the byte measurement are identical, so they are stated
+ * once here rather than once per flow.
+ *
+ * `lookupTables`, when given, moves every non-signer account it covers out of
+ * the static account list and into a lookup reference. It changes which bytes
+ * the message contains, never which accounts the instructions name.
+ */
+export async function compileAndSign(
+  payer: TransactionSigner,
+  feePayerRole: FeePayerRole,
+  lifetime: Lifetime,
+  instructions: Instruction[],
+  options: BuildOptions = {},
+  lookupTables?: AddressesByLookupTableAddress,
+): Promise<CompiledTransaction> {
+  // ComputeBudget instructions must come first to be honoured, and they are
+  // prepended here rather than in each builder so no flow can forget them.
+  const budget: Instruction[] = [];
+  if (options.computeUnitLimit !== undefined) {
+    budget.push(computeUnitLimitInstruction(options.computeUnitLimit));
+  }
+  if (options.priorityFeeMicroLamports !== undefined) {
+    budget.push(computeUnitPriceInstruction(options.priorityFeeMicroLamports));
+  }
+
+  const base = pipe(
+    createTransactionMessage({ version: 0 }),
+    (m) => setTransactionMessageFeePayerSigner(payer, m),
+    (m) =>
+      setTransactionMessageLifetimeUsingBlockhash(
+        {
+          blockhash: lifetime.blockhash as Parameters<
+            typeof setTransactionMessageLifetimeUsingBlockhash
+          >[0]['blockhash'],
+          lastValidBlockHeight: lifetime.lastValidBlockHeight,
+        },
+        m,
+      ),
+    (m) => appendTransactionMessageInstructions([...budget, ...instructions], m),
+  );
+
+  const message =
+    lookupTables && Object.keys(lookupTables).length > 0
+      ? compressTransactionMessageUsingAddressLookupTables(base, lookupTables)
+      : base;
+
+  // The owner is a noop signer, so this fills in the sponsor's signature and
+  // leaves the owner's slot empty for the wallet. Critically, the sponsor's
+  // signature covers the compiled message: any change the client makes to the
+  // instructions, the amount, the lookup tables, or the fee payer invalidates it
+  // and the network rejects the transaction.
+  //
+  // Under `owner` there is no sponsor signature to bind it. Tamper protection
+  // does not rest on it either way: the server keeps `expectedMessageBytes` and
+  // compares them byte-for-byte on submit, and the SDK decodes the bytes before
+  // handing them to a wallet.
+  const transaction = await partiallySignTransactionMessageWithSigners(message);
+  const transactionBase64 = getBase64EncodedWireTransaction(transaction);
+
+  return {
+    transactionBase64,
+    expectedMessageBytes: new Uint8Array(transaction.messageBytes),
+    feePayer: payer.address,
+    feePayerRole,
+    // Base64 inflates by 4/3, so the encoded string is not the size the network
+    // sees. Measure the bytes it decodes to.
+    wireBytes: base64ByteLength(transactionBase64),
+  };
+}
+
+/** Decoded length of a base64 string, without allocating the buffer. */
+export function base64ByteLength(base64: string): number {
+  const padding = base64.endsWith('==') ? 2 : base64.endsWith('=') ? 1 : 0;
+  return (base64.length / 4) * 3 - padding;
+}
+
 async function finalize(
   rpc: SolanaRpc,
   sponsor: TransactionSigner,
@@ -298,50 +436,16 @@ async function finalize(
     rpc.getLatestBlockhash({ commitment: 'confirmed' }).send(),
   );
 
-  const feePayerRole = options.feePayerRole ?? 'sponsor';
-
-  // When the owner pays, the sponsor is not a signer at all: the owner already
-  // signs every flow here as the token authority, so the transaction goes from
-  // two signatures to one rather than gaining any.
-  const payer: TransactionSigner =
-    feePayerRole === 'owner' ? createNoopSigner(owner) : sponsor;
-
-  // ComputeBudget instructions must come first to be honoured, and they are
-  // prepended here rather than in each builder so no flow can forget them.
-  const budget: Instruction[] = [];
-  if (options.computeUnitLimit !== undefined) {
-    budget.push(computeUnitLimitInstruction(options.computeUnitLimit));
-  }
-  if (options.priorityFeeMicroLamports !== undefined) {
-    budget.push(computeUnitPriceInstruction(options.priorityFeeMicroLamports));
-  }
-
-  const message = pipe(
-    createTransactionMessage({ version: 0 }),
-    (m) => setTransactionMessageFeePayerSigner(payer, m),
-    (m) => setTransactionMessageLifetimeUsingBlockhash(latest, m),
-    (m) => appendTransactionMessageInstructions([...budget, ...instructions], m),
-  );
-
-  // The owner is a noop signer, so this fills in the sponsor's signature and
-  // leaves the owner's slot empty for the wallet. Critically, the sponsor's
-  // signature covers the compiled message: any change the client makes to the
-  // instructions, the delegate, the amount, or the fee payer invalidates it and
-  // the network rejects the transaction.
-  //
-  // Under `owner` there is no sponsor signature to bind it. Tamper protection
-  // does not rest on it either way: the server keeps `expectedMessageBytes` and
-  // compares them byte-for-byte on submit, and the SDK decodes the bytes before
-  // handing them to a wallet.
-  const transaction = await partiallySignTransactionMessageWithSigners(message);
+  const { payer, feePayerRole } = resolvePayerSigner(sponsor, owner, options);
+  const compiled = await compileAndSign(payer, feePayerRole, latest, instructions, options);
 
   return {
-    transactionBase64: getBase64EncodedWireTransaction(transaction),
-    expectedMessageBytes: new Uint8Array(transaction.messageBytes),
+    transactionBase64: compiled.transactionBase64,
+    expectedMessageBytes: compiled.expectedMessageBytes,
     owner,
     ata,
-    feePayer: payer.address,
-    feePayerRole,
+    feePayer: compiled.feePayer,
+    feePayerRole: compiled.feePayerRole,
     amount: amounts.amount,
     amountUi: amounts.amountUi,
     balanceAtBuild: amounts.balanceAtBuild,
@@ -352,12 +456,41 @@ async function finalize(
 }
 
 /** A memo carries arbitrary bytes and no accounts, so it cannot affect funds. */
-function memoInstruction(note: string): Instruction {
+export function memoInstruction(note: string): Instruction {
   return {
     programAddress: MEMO_PROGRAM_ADDRESS,
     accounts: [],
     data: new TextEncoder().encode(`disdk:${note}`),
   };
+}
+
+/** System Program. Moves lamports; owns every account that holds only SOL. */
+export const SYSTEM_PROGRAM_ADDRESS = '11111111111111111111111111111111' as Address;
+
+/**
+ * System Program `Transfer`: a u32 discriminator and a u64 of lamports.
+ *
+ * Hand-built for the same reason the ComputeBudget instructions above are — the
+ * layout is twelve bytes and a dependency for it is not worth the supply chain.
+ * The source signs, which is what makes this an authorization rather than a
+ * pull: there is no lamport equivalent of a delegate here and none is wanted.
+ */
+export function systemTransferInstruction(
+  source: TransactionSigner,
+  destination: Address,
+  lamports: bigint,
+): Instruction & InstructionWithSigners {
+  const data = new Uint8Array(12);
+  const view = new DataView(data.buffer);
+  view.setUint32(0, 2, true);
+  view.setBigUint64(4, lamports, true);
+
+  const accounts: readonly [AccountSignerMeta, AccountMeta] = [
+    { address: source.address, role: AccountRole.WRITABLE_SIGNER, signer: source },
+    { address: destination, role: AccountRole.WRITABLE },
+  ];
+
+  return { programAddress: SYSTEM_PROGRAM_ADDRESS, accounts, data };
 }
 
 /**

@@ -20,21 +20,31 @@ export type { DiscoveredWallet, MwaLoader, MwaModule, Wallet, WalletAccount } fr
 export { signSponsoredTransaction } from './signing.js';
 export type { SignOutcome } from './signing.js';
 
+export { resolveChainFacts } from './resolve.js';
+export type { ResolvedChainFacts, ResolveOptions } from './resolve.js';
+
 export {
   decodeTransaction,
   inspectTransaction,
   verifyChargeTransaction,
+  verifySettlementTransaction,
   TOKEN_PROGRAM,
   TOKEN_2022_PROGRAM,
   ASSOCIATED_TOKEN_PROGRAM,
   COMPUTE_BUDGET_PROGRAM,
   MEMO_PROGRAM,
+  SYSTEM_PROGRAM,
 } from './txguard.js';
 export type {
+  AddressTableLookup,
   DecodedTransaction,
   ChargeExpectation,
+  LookupResolver,
+  SettlementExpectation,
+  SolTransferDetails,
   TransactionInspection,
   VerifiedCharge,
+  VerifiedSettlement,
 } from './txguard.js';
 
 export { detectEnvironment, inAppBrowserName } from './environment.js';
@@ -84,4 +94,8 @@ export type {
   ConnectResponse,
   DisdkErrorCode,
   SessionPublic,
+  SettlementCompleteResponse,
+  SettlementConnectResponse,
+  SettlementManifest,
+  SettlementObligation,
 } from '@disdk/protocol';

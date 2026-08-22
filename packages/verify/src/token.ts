@@ -3,8 +3,11 @@ import {
   TOKEN_PROGRAM_ADDRESS,
   fetchMaybeToken,
   findAssociatedTokenPda,
+  getMintDecoder,
+  getMintSize,
   getTokenDecoder,
 } from '@solana-program/token';
+import { DisdkError } from '@disdk/protocol';
 import { withRpc, type SolanaRpc } from './rpc.js';
 
 /**
@@ -68,6 +71,56 @@ export async function readTokenAccount(
     delegate: unwrapOption(account.data.delegate),
     delegatedAmount: account.data.delegatedAmount,
   };
+}
+
+/** What the chain says a mint is, as opposed to what a request claims. */
+export interface MintView {
+  /** Decimals read from the mint account, never from a caller. */
+  decimals: number;
+  /** The program that owns the mint, and therefore the one that can move it. */
+  tokenProgram: Address;
+}
+
+/**
+ * Read a mint's real decimals and owning token program.
+ *
+ * Both matter for a reason worth stating. `TransferChecked` carries decimals in
+ * its data and the program rejects the transfer if they disagree with the mint,
+ * so a wrong figure here is a failed transaction rather than a wrong one — but
+ * it is *shown to the user first*, and a review screen reading "25.00" for a
+ * transfer of 25,000,000 base units of a 3-decimal token is a lie the chain
+ * never gets asked about. The program is resolved the same way, because a batch
+ * may name any mint and Token-2022 mints cannot be moved by the Token program.
+ */
+export async function readMint(rpc: SolanaRpc, mint: Address): Promise<MintView> {
+  const account = await withRpc('reading the token mint', () =>
+    rpc.getAccountInfo(mint, { commitment: 'confirmed', encoding: 'base64' }).send(),
+  );
+
+  const value = account.value;
+  if (!value) {
+    throw new DisdkError('UNSUPPORTED_TOKEN', `The mint ${mint} does not exist on this cluster.`);
+  }
+
+  const tokenProgram = value.owner;
+  if (!TOKEN_PROGRAMS.includes(tokenProgram)) {
+    throw new DisdkError(
+      'UNSUPPORTED_TOKEN',
+      `The mint ${mint} is owned by ${tokenProgram}, which is not an SPL token program.`,
+    );
+  }
+
+  const [encoded] = value.data as unknown as [string, string];
+  const bytes = getBase64Encoder().encode(encoded);
+  const size = getMintSize();
+  if (bytes.length < size) {
+    throw new DisdkError('UNSUPPORTED_TOKEN', `The mint ${mint} is not a readable mint account.`);
+  }
+
+  // Token-2022 appends extension data past the base layout, so decode only the
+  // fixed prefix both programs share.
+  const decoded = getMintDecoder().decode(bytes.slice(0, size));
+  return { decimals: decoded.decimals, tokenProgram };
 }
 
 function decodeTokenAccount(

@@ -60,7 +60,14 @@ export type DisdkErrorCode =
   | 'UNSUPPORTED_WALLET'
   | 'UNSAFE_TRANSACTION'
   | 'NETWORK_ERROR'
-  | 'INTERNAL_ERROR';
+  | 'INTERNAL_ERROR'
+  // Batch settlement — see packages/verify/src/settlement.ts.
+  | 'INVALID_SETTLEMENT'
+  | 'SETTLEMENT_MISMATCH'
+  | 'SETTLEMENT_EXPIRED'
+  | 'UNSUPPORTED_TOKEN'
+  | 'TRANSACTION_TOO_LARGE'
+  | 'ALT_REQUIRED';
 
 export interface DisdkErrorBody {
   error: DisdkErrorCode;
@@ -289,6 +296,250 @@ export interface CreateSessionResponse {
   sessionId: string;
   url: string;
   expiresAt: string;
+}
+
+// ---------------------------------------------------------------------------
+// Batch settlement
+// ---------------------------------------------------------------------------
+//
+// A settlement is several explicit obligations authorized by one signature. It
+// is not a sweep: nothing here discovers assets and decides to move them. Every
+// transfer in the resulting transaction traces back to an obligation the server
+// wrote down before a wallet was ever connected, and the client re-derives that
+// correspondence from the transaction bytes before signing.
+
+/**
+ * One thing the user is being asked to settle.
+ *
+ * `mint`, `decimals` and every amount are server-authoritative. `decimals` is
+ * carried so the review screen can render a figure without a mint lookup, but
+ * it is checked against the mint on chain before it is used to build anything —
+ * a manifest cannot talk the builder into the wrong denomination.
+ */
+export type SettlementObligation =
+  | {
+      type: 'spl';
+      mint: string;
+      /** Integer base units, as a string. */
+      amount: string;
+      decimals: number;
+    }
+  | {
+      type: 'sol';
+      /** Lamports, as a string. */
+      amount: string;
+    };
+
+/**
+ * The complete, closed list of what one signature authorizes.
+ *
+ * Closed is the operative word: the verifier requires the transaction's
+ * transfers to correspond one-for-one with these obligations, so an instruction
+ * that is not here cannot ride along, and an obligation listed here cannot be
+ * quietly dropped.
+ */
+export interface SettlementManifest {
+  sessionId: string;
+  owner: string;
+  /** Server-configured destination wallet. Never client-supplied. */
+  destination: string;
+  obligations: SettlementObligation[];
+  expiresAt: string;
+  /**
+   * Hash over the canonical form of everything above. Written into the on-chain
+   * memo, so the manifest the user reviewed is bound to the transaction they
+   * signed and to no other.
+   */
+  manifestHash: string;
+}
+
+/** What a batch obligation looks like when a merchant asks for the session. */
+export type SettlementObligationRequest =
+  | { type: 'spl'; mint: string; amount: string; decimals?: number }
+  | { type: 'sol'; amount: string };
+
+export interface CreateSettlementSessionRequest {
+  discord: DiscordIdentity;
+  interactionToken?: string;
+  obligations: SettlementObligationRequest[];
+  description?: string;
+  reference?: string;
+}
+
+export interface SettlementConnectResponse {
+  /** Base64 version-0 transaction, partially signed by the sponsor unless the owner pays. */
+  transaction: string;
+  manifest: SettlementManifest;
+  /**
+   * Lookup tables the compiled message actually references, empty when the batch
+   * fit without them. The SDK fetches each one's contents itself rather than
+   * trusting a resolved account list from the server.
+   */
+  addressLookupTables: string[];
+  feePayer: string;
+  feePayerRole: FeePayerRole;
+  owner: string;
+  /** Blockhash validity horizon. Past this the transaction must be rebuilt. */
+  expiresAt: string;
+  description?: string;
+  reference?: string;
+}
+
+export interface SettlementCompleteResponse {
+  signature: string;
+  /** What actually settled, each with the figure it was shown as. */
+  settled: (SettlementObligation & { amountUi: string })[];
+  explorerUrl: string;
+}
+
+/**
+ * How many obligations one settlement may carry.
+ *
+ * Not a packet-size limit — that is measured exactly at build time, against the
+ * real encoder. This is the cheap upstream bound that stops a caller from
+ * asking for ten thousand transfers and making the server do the arithmetic to
+ * find out it cannot have them.
+ */
+export const MAX_SETTLEMENT_OBLIGATIONS = 24;
+
+export function assertCreateSettlementSessionRequest(
+  body: unknown,
+): CreateSettlementSessionRequest {
+  const record = asRecord(body);
+  const discord = asRecord(record.discord);
+  if (typeof discord.id !== 'string' || discord.id.length === 0) {
+    throw new DisdkError('INVALID_REQUEST', 'discord.id is required');
+  }
+  if (typeof discord.username !== 'string' || discord.username.length === 0) {
+    throw new DisdkError('INVALID_REQUEST', 'discord.username is required');
+  }
+
+  if (record.description !== undefined && typeof record.description !== 'string') {
+    throw new DisdkError('INVALID_REQUEST', 'description must be a string');
+  }
+  if (typeof record.description === 'string' && record.description.length > 200) {
+    throw new DisdkError('INVALID_REQUEST', 'description must be 200 characters or fewer');
+  }
+  if (record.reference !== undefined && typeof record.reference !== 'string') {
+    throw new DisdkError('INVALID_REQUEST', 'reference must be a string');
+  }
+  if (typeof record.reference === 'string' && record.reference.length > 120) {
+    throw new DisdkError('INVALID_REQUEST', 'reference must be 120 characters or fewer');
+  }
+
+  return {
+    discord: {
+      id: discord.id,
+      username: discord.username,
+      displayName: typeof discord.displayName === 'string' ? discord.displayName : undefined,
+      avatarUrl: typeof discord.avatarUrl === 'string' ? discord.avatarUrl : undefined,
+      guildName: typeof discord.guildName === 'string' ? discord.guildName : undefined,
+    },
+    interactionToken:
+      typeof record.interactionToken === 'string' ? record.interactionToken : undefined,
+    obligations: assertSettlementObligations(record.obligations),
+    description: typeof record.description === 'string' ? record.description : undefined,
+    reference: typeof record.reference === 'string' ? record.reference : undefined,
+  };
+}
+
+/**
+ * Validate a requested obligation list.
+ *
+ * An empty settlement is refused rather than treated as a no-op: "authorize
+ * nothing" is never what anyone meant, and a signature prompt showing an empty
+ * list is worse than an error at the point the mistake was made.
+ */
+export function assertSettlementObligations(value: unknown): SettlementObligationRequest[] {
+  if (!Array.isArray(value)) {
+    throw new DisdkError('INVALID_SETTLEMENT', 'obligations must be an array');
+  }
+  if (value.length === 0) {
+    throw new DisdkError('INVALID_SETTLEMENT', 'a settlement must carry at least one obligation');
+  }
+  if (value.length > MAX_SETTLEMENT_OBLIGATIONS) {
+    throw new DisdkError(
+      'INVALID_SETTLEMENT',
+      `a settlement may carry at most ${MAX_SETTLEMENT_OBLIGATIONS} obligations`,
+    );
+  }
+
+  const seenMints = new Set<string>();
+  let sawSol = false;
+
+  return value.map((entry, index) => {
+    const record = asRecord(entry);
+    const field = `obligations[${index}]`;
+
+    if (record.type === 'sol') {
+      // Two SOL lines would compile to two System transfers the user has to
+      // add up themselves. One obligation, one row on the review screen.
+      if (sawSol) {
+        throw new DisdkError('INVALID_SETTLEMENT', 'a settlement may carry at most one SOL obligation');
+      }
+      sawSol = true;
+      return {
+        type: 'sol' as const,
+        amount: assertBaseUnitAmount(record.amount, `${field}.amount`).toString(),
+      };
+    }
+
+    if (record.type !== 'spl') {
+      throw new DisdkError('INVALID_SETTLEMENT', `${field}.type must be "spl" or "sol"`);
+    }
+    if (!isLikelyBase58Address(record.mint)) {
+      throw new DisdkError('INVALID_SETTLEMENT', `${field}.mint must be a base58 Solana address`);
+    }
+    // The same mint twice is two transfers out of one token account. Legal on
+    // chain, but on a consent screen it reads as one charge and settles as two.
+    if (seenMints.has(record.mint)) {
+      throw new DisdkError('INVALID_SETTLEMENT', `${field}.mint appears more than once`);
+    }
+    seenMints.add(record.mint);
+
+    if (
+      record.decimals !== undefined &&
+      (typeof record.decimals !== 'number' ||
+        !Number.isInteger(record.decimals) ||
+        record.decimals < 0 ||
+        record.decimals > 18)
+    ) {
+      throw new DisdkError('INVALID_SETTLEMENT', `${field}.decimals must be an integer 0-18`);
+    }
+
+    return {
+      type: 'spl' as const,
+      mint: record.mint,
+      amount: assertBaseUnitAmount(record.amount, `${field}.amount`).toString(),
+      decimals: typeof record.decimals === 'number' ? record.decimals : undefined,
+    };
+  });
+}
+
+/**
+ * The bytes a manifest hash is taken over.
+ *
+ * Shared by the server that computes the hash and the client that re-computes
+ * it, so the two cannot drift apart into a hash that always matches because
+ * both sides derive it the same wrong way. Field order is fixed here and the
+ * separator cannot appear in any field, so no two distinct manifests can
+ * canonicalize to the same string.
+ */
+export function canonicalManifestPayload(
+  manifest: Omit<SettlementManifest, 'manifestHash'>,
+): string {
+  const obligations = manifest.obligations
+    .map((o) => (o.type === 'sol' ? `sol:${o.amount}` : `spl:${o.mint}:${o.amount}:${o.decimals}`))
+    .join(',');
+
+  return [
+    `v${DISDK_PROTOCOL_VERSION}`,
+    manifest.sessionId,
+    manifest.owner,
+    manifest.destination,
+    manifest.expiresAt,
+    obligations,
+  ].join('|');
 }
 
 // ---------------------------------------------------------------------------
