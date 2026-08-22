@@ -1,3 +1,4 @@
+import { DisdkError, type ChargeToken } from '@disdk/protocol';
 import {
   AltRegistry,
   MemoryChargeLedger,
@@ -28,7 +29,17 @@ export interface Services {
   config: ServerConfig;
   rpc: SolanaRpc;
   store: SessionStore;
+  /** The default charge token (USDC). Kept for anything that has no session to resolve a token from. */
   chargeConfig: ChargeSessionConfig;
+  /**
+   * How a charge is built for a specific token, sharing the one treasury —
+   * the treasury is a wallet, not a token account, so it needs no per-token
+   * configuration of its own. Throws `INVALID_REQUEST` for a token this
+   * deployment has no mint configured for, which is checked again here rather
+   * than only at session creation because a session predates this call by
+   * however long the link sits unused, and USDT support is opt-in.
+   */
+  chargeConfigFor(token?: ChargeToken): ChargeSessionConfig;
   /** How a batch settlement is built, mirroring `chargeConfig` for the charge. */
   settlementConfig: SettlementConfig;
   /**
@@ -71,6 +82,22 @@ export function createServices(
       symbol: config.mintSymbol,
       treasury: config.charge.terms.treasury,
       createTreasuryAtaIfMissing: config.charge.terms.createTreasuryAtaIfMissing,
+    },
+    chargeConfigFor(token = 'USDC') {
+      const accepted = config.acceptedTokens[token];
+      if (!accepted) {
+        throw new DisdkError(
+          'INVALID_REQUEST',
+          `This deployment does not accept ${token}. Set ${token}_MINT to enable it.`,
+        );
+      }
+      return {
+        mint: accepted.mint,
+        decimals: accepted.decimals,
+        symbol: accepted.symbol,
+        treasury: config.charge.terms.treasury,
+        createTreasuryAtaIfMissing: config.charge.terms.createTreasuryAtaIfMissing,
+      };
     },
     settlementConfig: {
       destination: config.settlement.destination,

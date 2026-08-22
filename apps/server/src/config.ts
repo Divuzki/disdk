@@ -1,4 +1,13 @@
-import { DisdkError, USDC_DECIMALS, USDC_MINTS, isCluster, type Cluster } from '@disdk/protocol';
+import {
+  DisdkError,
+  USDC_DECIMALS,
+  USDC_MINTS,
+  USDT_DECIMALS,
+  USDT_MINTS,
+  isCluster,
+  type ChargeToken,
+  type Cluster,
+} from '@disdk/protocol';
 import { address, type Address, type KeyPairSigner } from '@solana/kit';
 import {
   describeTerms,
@@ -10,6 +19,12 @@ import {
   type ChargeTerms,
 } from '@disdk/verify';
 
+export interface AcceptedToken {
+  mint: Address;
+  symbol: string;
+  decimals: number;
+}
+
 export interface ServerConfig {
   port: number;
   /** Where the connect page is served from. Session links point here. */
@@ -20,9 +35,18 @@ export interface ServerConfig {
   cluster: Cluster;
   rpcUrl: string;
 
+  /** The default charge token — USDC's mint, symbol and decimals. */
   mint: Address;
   mintSymbol: string;
   decimals: number;
+  /**
+   * Stablecoins this deployment will charge in, keyed by the symbol a session
+   * names in `charge.token`. USDC is always present. USDT is present only when
+   * `USDT_MINT` resolves to something — the mainnet default, or an explicit
+   * env override — so a session naming USDT fails at creation, not at connect
+   * time, when this deployment has no mint configured for it.
+   */
+  acceptedTokens: Partial<Record<ChargeToken, AcceptedToken>> & { USDC: AcceptedToken };
   sponsor: KeyPairSigner;
 
   /**
@@ -139,6 +163,23 @@ export async function loadConfig(env: NodeJS.ProcessEnv = process.env): Promise<
 
   const decimals = env.USDC_DECIMALS ? Number(env.USDC_DECIMALS) : USDC_DECIMALS;
   const mintSymbol = env.MINT_SYMBOL ?? 'USDC';
+  const usdcMint = address(env.USDC_MINT ?? USDC_MINTS[cluster]);
+
+  const acceptedTokens: ServerConfig['acceptedTokens'] = {
+    USDC: { mint: usdcMint, symbol: mintSymbol, decimals },
+  };
+
+  // USDT is opt-in: present only when a mint actually resolves for this
+  // cluster. Unlike USDC there is no fabricated devnet fallback here — see
+  // USDT_MINTS — so on devnet this stays absent until USDT_MINT is set.
+  const usdtMintValue = env.USDT_MINT ?? USDT_MINTS[cluster];
+  if (usdtMintValue) {
+    acceptedTokens.USDT = {
+      mint: address(usdtMintValue),
+      symbol: env.USDT_SYMBOL ?? 'USDT',
+      decimals: env.USDT_DECIMALS ? Number(env.USDT_DECIMALS) : USDT_DECIMALS,
+    };
+  }
 
   const sponsor = await loadSponsorSigner(sponsorSecret);
 
@@ -151,9 +192,10 @@ export async function loadConfig(env: NodeJS.ProcessEnv = process.env): Promise<
     cluster,
     rpcUrl: env.RPC_URL ?? DEFAULT_RPC[cluster],
 
-    mint: address(env.USDC_MINT ?? USDC_MINTS[cluster]),
+    mint: usdcMint,
     mintSymbol,
     decimals,
+    acceptedTokens,
     sponsor,
 
     feePayerFallback: env.FEE_PAYER_FALLBACK === 'true',

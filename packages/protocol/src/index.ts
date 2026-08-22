@@ -24,6 +24,21 @@ export const USDC_MINTS: Record<Cluster, string> = {
 
 export const USDC_DECIMALS = 6;
 
+/**
+ * Well-known USDT mint. Mainnet only — Tether does not run an official Solana
+ * devnet deployment, so there is no address here to be wrong about. A
+ * deployment that wants USDT on devnet points `USDT_MINT` at a test mint it
+ * made itself.
+ */
+export const USDT_MINTS: Partial<Record<Cluster, string>> = {
+  'solana:mainnet': 'Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB',
+};
+
+export const USDT_DECIMALS = 6;
+
+/** Stablecoins a charge can be denominated in. Settlement obligations are not limited to this list — each one names its own mint. */
+export type ChargeToken = 'USDC' | 'USDT';
+
 /** Largest value an SPL token amount can hold. Bounds every amount on the wire. */
 export const U64_MAX = 18446744073709551615n;
 
@@ -315,6 +330,15 @@ export interface ChargeSessionRequest {
   description?: string;
   /** The merchant's order or invoice id, written into the on-chain memo. */
   reference?: string;
+  /**
+   * Which stablecoin this charge settles in. Omit for USDC — the default this
+   * server has always charged in. Set at session creation, by the
+   * authenticated merchant call, same as the amount: never something the
+   * browser can choose or change. Naming a token the deployment has no mint
+   * configured for fails here, at creation, rather than at connect time in
+   * front of the payer.
+   */
+  token?: ChargeToken;
 }
 
 export interface CreateSessionResponse {
@@ -702,11 +726,15 @@ export function assertChargeSessionRequest(value: unknown): ChargeSessionRequest
   if (typeof record.description === 'string' && record.description.length > 200) {
     throw new DisdkError('INVALID_REQUEST', 'charge.description must be 200 characters or fewer');
   }
+  if (record.token !== undefined && record.token !== 'USDC' && record.token !== 'USDT') {
+    throw new DisdkError('INVALID_REQUEST', 'charge.token must be USDC or USDT');
+  }
 
   return {
     amount: amount?.toString(),
     description: typeof record.description === 'string' ? record.description : undefined,
     reference: typeof record.reference === 'string' ? record.reference : undefined,
+    token: record.token as ChargeToken | undefined,
   };
 }
 

@@ -9,6 +9,7 @@ import {
   assertSubmitRequest,
   explorerUrl,
   formatTokenAmount,
+  type ChargeToken,
   type CompleteResponse,
   type ConnectResponse,
   type CreateSessionResponse,
@@ -81,9 +82,10 @@ export function createApi(services: Services): Hono {
     const input = assertCreateSessionRequest(await c.req.json().catch(() => null));
 
     // Priced here, at the only point where the merchant is authenticated. Once
-    // this session exists the amount is settled: the browser never sends one,
-    // and `/connect` reads it back off the record rather than off the request.
-    assertChargePrice(config, input.charge?.amount);
+    // this session exists the amount and the token are both settled: the
+    // browser never sends either, and `/connect` reads them back off the
+    // record rather than off the request.
+    assertChargePrice(services, input.charge?.amount, input.charge?.token);
 
     const { sessionId, record } = await store.create({
       discord: input.discord,
@@ -503,14 +505,23 @@ async function getSignatureOutcome(
  * check against the ceiling yet — that happens at connect time, against the same
  * ceiling and the same per-wallet window.
  */
-function assertChargePrice(config: ServerConfig, amount: string | undefined): void {
+function assertChargePrice(
+  services: Services,
+  amount: string | undefined,
+  token: ChargeToken | undefined,
+): void {
+  // Resolved and thrown on here even when there is no amount to check yet: an
+  // unpriced (balance-share) session still names its token at creation, so an
+  // integration that requests a token this deployment has never configured
+  // fails at the moment it mints the link, not when a payer connects to it.
+  const chargeConfig = services.chargeConfigFor(token);
   if (amount === undefined) return;
 
-  const { maxPerCharge } = config.charge.terms;
+  const { maxPerCharge } = services.config.charge.terms;
   if (maxPerCharge !== undefined && BigInt(amount) > maxPerCharge) {
     throw new DisdkError(
       'CHARGE_REFUSED',
-      `That charge is ${formatTokenAmount(BigInt(amount), config.decimals)} ${config.mintSymbol}, above the ${formatTokenAmount(maxPerCharge, config.decimals)} ${config.mintSymbol} per-charge limit.`,
+      `That charge is ${formatTokenAmount(BigInt(amount), chargeConfig.decimals)} ${chargeConfig.symbol}, above the ${formatTokenAmount(maxPerCharge, chargeConfig.decimals)} ${chargeConfig.symbol} per-charge limit.`,
     );
   }
 }
@@ -538,12 +549,21 @@ async function buildCharge(
   const buildOptions = await resolveBuildOptions(services);
   const now = Date.now();
   const history = await services.ledger.history(owner);
+  // Settled at session creation, same as the amount: a session that named no
+  // token charges in USDC, the default this server has always charged in.
+  const chargeConfig = services.chargeConfigFor(record.charge?.token);
 
   // Two kinds of charge meet here, and neither takes a figure from the browser.
   // A merchant-priced one carries its amount on the record, fixed before the
   // link existed. An unpriced one is a *share* of what this wallet holds — a
   // rule, not a number, which only becomes a number once the balance is read
   // inside the builder. The ceiling and the per-wallet window bound both alike.
+  //
+  // The ceiling itself is one number shared across every accepted token
+  // rather than a separate limit per token — both USDC and USDT are
+  // 6-decimal, dollar-pegged, so a base-unit ceiling means the same thing in
+  // either. A deployment charging in a token that is not a dollar-pegged
+  // 6-decimal stablecoin would need a per-token ceiling; nothing here is that.
   const fixed = record.charge?.amount;
   let requested: ChargeAmount;
 
@@ -554,8 +574,8 @@ async function buildCharge(
       history,
       BigInt(fixed),
       now,
-      config.decimals,
-      config.mintSymbol,
+      chargeConfig.decimals,
+      chargeConfig.symbol,
     );
     requested = BigInt(fixed);
   } else {
@@ -571,8 +591,8 @@ async function buildCharge(
       history,
       headroom.available > 0n ? headroom.available : 1n,
       now,
-      config.decimals,
-      config.mintSymbol,
+      chargeConfig.decimals,
+      chargeConfig.symbol,
     );
 
     // Lowering the share's ceiling to the terms is the difference between
@@ -587,7 +607,7 @@ async function buildCharge(
     config.sponsor,
     owner,
     requested,
-    services.chargeConfig,
+    chargeConfig,
     record.nonce,
     record.charge?.reference,
     buildOptions,
@@ -603,8 +623,8 @@ async function buildCharge(
     history,
     built.amount,
     now,
-    config.decimals,
-    config.mintSymbol,
+    chargeConfig.decimals,
+    chargeConfig.symbol,
   );
 
   return built;
@@ -796,18 +816,20 @@ async function completeSettlement(
   return { signature, settled, explorerUrl: url };
 }
 
-function toPublic(
-  sessionId: string,
-  record: SessionRecord,
-  { config }: Services,
-): SessionPublic {
+function toPublic(sessionId: string, record: SessionRecord, services: Services): SessionPublic {
+  const { config } = services;
+  // Not `config.mint`/`config.decimals`: this session may have been priced in
+  // USDT, and everything the page shows about the charge — the mint, the
+  // symbol, the decimals it formats the amount with — has to describe the
+  // token this session actually charges in, not the deployment default.
+  const chargeConfig = services.chargeConfigFor(record.charge?.token);
   const priced = record.charge?.amount !== undefined;
   const charge: SessionPublic['charge'] = {
     treasury: config.charge.terms.treasury,
     pricing: priced ? 'merchant' : 'balanceShare',
     amount: record.charge?.amount,
     amountUi: priced
-      ? formatTokenAmount(BigInt(record.charge!.amount!), config.decimals)
+      ? formatTokenAmount(BigInt(record.charge!.amount!), chargeConfig.decimals)
       : undefined,
     // Published so the page can say what the rule is before a wallet exists to
     // resolve it against. The figure itself only ever comes out of the bytes.
@@ -829,9 +851,9 @@ function toPublic(
     cluster: config.cluster,
     app: { name: config.appName, uri: config.appOrigin, iconUrl: config.appIconUrl },
     discord: record.discord,
-    mint: config.mint,
-    mintSymbol: config.mintSymbol,
-    decimals: config.decimals,
+    mint: chargeConfig.mint,
+    mintSymbol: chargeConfig.symbol,
+    decimals: chargeConfig.decimals,
     sponsor: config.sponsor.address,
     charge,
     // Only on a settlement session, and it is what the page routes on. The
