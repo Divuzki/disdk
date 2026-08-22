@@ -168,6 +168,7 @@
       src="/disdk.global.js"
       data-disdk-auto
       data-api-base="http://localhost:8787"
+      data-rpc-url="https://api.mainnet-beta.solana.com"
       data-theme="auto"
     ></script>
 
@@ -212,6 +213,27 @@
           const session = await res.json();
           if (!res.ok) throw new Error(session.message || res.statusText);
 
+          // A settlement session carries a list rather than a price. Shown as a
+          // list here too: a total across different tokens is not a number that
+          // means anything, and the figures the wallet is asked to approve are
+          // decoded from the transaction itself at review time.
+          if (session.settlement) {
+            const lines = session.settlement.obligations.map((o) => {
+              const decimals = o.type === 'sol' ? 9 : o.decimals;
+              const amount = Number(o.amount) / 10 ** decimals;
+              const label = o.type === 'sol' ? 'SOL' : `${o.mint.slice(0, 4)}…${o.mint.slice(-4)}`;
+              return `  ${label}  ${amount}`;
+            });
+
+            say(
+              `Batch settlement on ${session.cluster} — one signature\n` +
+                `${lines.join('\n')}\n` +
+                `Settled to: ${session.settlement.destination}\n` +
+                `Network fee: paid for you by the sponsor`,
+            );
+            return;
+          }
+
           const charge = session.charge ?? {};
           const price =
             charge.pricing === 'balanceShare'
@@ -248,6 +270,11 @@
 
       addEventListener('disdk:connect', (e) => write(`connected  ${e.detail.publicKey}`));
       addEventListener('disdk:done', (e) => write(`paid       ${e.detail.amountUi} — ${e.detail.explorerUrl}`));
+      addEventListener('disdk:settled', (e) =>
+        write(
+          `settled    ${e.detail.settled.map((s) => s.amountUi).join(' · ')} — ${e.detail.explorerUrl}`,
+        ),
+      );
       addEventListener('disdk:error', (e) => write(`error      ${e.detail.code}: ${e.detail.message}`));
     </script>
   </body>

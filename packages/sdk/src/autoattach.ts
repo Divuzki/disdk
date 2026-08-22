@@ -6,7 +6,7 @@
  * the host page can listen to without importing anything.
  */
 
-import type { CompleteResponse } from '@disdk/protocol';
+import type { CompleteResponse, SettlementCompleteResponse } from '@disdk/protocol';
 import { createDisdk, type Disdk, type DisdkConfig } from './core.js';
 import type { DisdkState } from './events.js';
 import type { Theme } from './ui/modal.js';
@@ -73,6 +73,12 @@ export function autoAttach(options: AutoAttachOptions): { disdk: Disdk; stop(): 
       const label = element.getAttribute('data-disdk-label-done');
       element.textContent = label ?? 'Approved ✓';
       dispatch(element, 'disdk:done', result satisfies CompleteResponse);
+    });
+
+    disdk.on('settled', (result) => {
+      const label = element.getAttribute('data-disdk-label-done');
+      element.textContent = label ?? 'Settled ✓';
+      dispatch(element, 'disdk:settled', result satisfies SettlementCompleteResponse);
     });
 
     disdk.on('error', (error) => {
@@ -148,6 +154,12 @@ export function readScriptConfig(script: HTMLOrSVGScriptElement | null): AutoAtt
 
   const remote = element.getAttribute('data-remote-host-authority');
   if (remote) options.remoteHostAuthority = remote;
+
+  // Only batch settlement needs this, and only to check the transaction against
+  // the chain before signing. A charge names every account in its message, so a
+  // page that never settles a batch can leave it off.
+  const rpcUrl = element.getAttribute('data-rpc-url');
+  if (rpcUrl) options.rpcUrl = rpcUrl;
 
   if (element.getAttribute('data-observe') === 'false') options.observe = false;
 

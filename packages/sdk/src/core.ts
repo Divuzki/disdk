@@ -443,7 +443,12 @@ class DisdkClient implements Disdk {
   async #runFromWallet(entry: DiscoveredWallet): Promise<void> {
     try {
       await this.connect(entry);
-      await this.pay();
+      // The session says which flow this is. Routing on it here means the
+      // wallet picker, the review screen and the approve button are the same
+      // ones a charge uses — a settlement is a different transaction, not a
+      // different checkout.
+      if (this.#session?.settlement) await this.settleBatch();
+      else await this.pay();
     } catch (error) {
       this.#fail(error);
     }
@@ -458,6 +463,11 @@ class DisdkClient implements Disdk {
         if (settled === null) return;
         this.#settlementFlow?.resolve(settled);
         this.#settlementFlow = null;
+        // `start()` is waiting on the charge flow's promise even when the
+        // session turned out to be a settlement. Release it, or a page that
+        // awaits `start()` hangs on a settlement that has already landed.
+        this.#flow?.resolve(null);
+        this.#flow = null;
         return;
       }
 
@@ -615,6 +625,7 @@ class DisdkClient implements Disdk {
         : await this.#api.submitSettlement(session.sessionId, outcome.signedTransaction);
 
     this.#setState('done');
+    this.#emitter.emit('settled', result);
     this.#modal?.showSuccess({
       amountUi: result.settled.map((s) => s.amountUi).join(' · '),
       symbol: '',

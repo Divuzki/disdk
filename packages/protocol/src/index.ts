@@ -124,11 +124,36 @@ export interface SessionPublic {
    * nothing left for it to influence.
    */
   charge: ChargePublic;
+  /**
+   * Present when this session settles a batch rather than a single charge.
+   *
+   * Its presence is what tells the page which flow it is looking at. A
+   * settlement session still carries {@link SessionPublic.charge} so an older
+   * client renders something coherent rather than crashing, but a client that
+   * understands settlements reads this and calls `settleBatch` instead of `pay`.
+   */
+  settlement?: SettlementPublic;
   expiresAt: string;
   /** Set once the flow has completed successfully. */
   signature?: string;
   /** Base-unit amount actually paid, set once complete. */
   paidAmount?: string;
+}
+
+/**
+ * The obligations a settlement session was created with, for display before a
+ * wallet is connected.
+ *
+ * Advisory only. The figures a user is asked to approve are decoded from the
+ * transaction bytes at review time, never from here — this exists so the page
+ * can say what it is about to ask for before there is a transaction to read.
+ */
+export interface SettlementPublic {
+  /** Server-configured destination wallet. */
+  destination: string;
+  obligations: SettlementObligation[];
+  description?: string;
+  reference?: string;
 }
 
 /**

@@ -1,4 +1,9 @@
-import type { CompleteResponse, DisdkError, SessionPublic } from '@disdk/protocol';
+import type {
+  CompleteResponse,
+  DisdkError,
+  SessionPublic,
+  SettlementCompleteResponse,
+} from '@disdk/protocol';
 import type { DiscoveredWallet } from './wallets.js';
 
 export type DisdkState =
@@ -19,6 +24,12 @@ export interface DisdkEventMap {
   wallets: DiscoveredWallet[];
   connect: { publicKey: string; walletName: string };
   done: CompleteResponse;
+  /**
+   * A batch settlement landed. Separate from `done` because the results differ
+   * in kind: a charge has an amount, a settlement has a list, and collapsing
+   * the list into one figure is exactly what this feature must never do.
+   */
+  settled: SettlementCompleteResponse;
   error: DisdkError;
   disconnect: void;
 }

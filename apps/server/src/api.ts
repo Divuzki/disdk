@@ -834,6 +834,17 @@ function toPublic(
     decimals: config.decimals,
     sponsor: config.sponsor.address,
     charge,
+    // Only on a settlement session, and it is what the page routes on. The
+    // amounts here are for display before a wallet exists; the ones the user
+    // approves come out of the transaction.
+    settlement: record.obligations?.length
+      ? {
+          destination: config.settlement.destination,
+          obligations: record.obligations,
+          description: record.charge?.description,
+          reference: record.charge?.reference,
+        }
+      : undefined,
     expiresAt: new Date(record.expiresAt).toISOString(),
     signature: record.signature,
     paidAmount: record.paidAmount,
