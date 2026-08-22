@@ -70,9 +70,9 @@ export async function verifySignedTransaction(
  * path, where the server never sees the signed bytes).
  *
  * The on-chain message must be byte-identical to what the server built, which
- * transitively proves the delegate, mint, owner, amount and fee payer.
+ * transitively proves the destination, mint, owner, amount and fee payer.
  */
-export async function verifyOnChainPermit(
+export async function verifyOnChainTransaction(
   rpc: SolanaRpc,
   signature: string,
   expected: BuiltTransaction,

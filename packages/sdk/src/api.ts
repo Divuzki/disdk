@@ -1,12 +1,9 @@
 import {
   DisdkError,
-  type AuthorizeSweepResponse,
   type CompleteResponse,
   type ConnectResponse,
   type DisdkErrorBody,
-  type PermitStatus,
   type SessionPublic,
-  type SweepLeg,
 } from '@disdk/protocol';
 
 /** Thin client over the disdk server. All state lives server-side. */
@@ -24,29 +21,12 @@ export class DisdkApi {
   connect(
     sessionId: string,
     publicKey: string,
-    leg?: SweepLeg,
     /** Base units, for a user-priced charge only. The server bounds it. */
     amount?: string,
   ): Promise<ConnectResponse> {
     return this.#request('POST', `/api/sessions/${encodeURIComponent(sessionId)}/connect`, {
       publicKey,
-      ...(leg ? { leg } : {}),
       ...(amount ? { amount } : {}),
-    });
-  }
-
-  /**
-   * Record the user's yes to a sweep offer.
-   *
-   * The only call in this client that turns an offer into something the server
-   * will build a transfer for, and the only one that should ever be reached from
-   * a deliberate click rather than from flow control. Nothing else here can
-   * produce a sweepable session, so a bug that never calls this is a sweep that
-   * never happens — which is the right way round for it to fail.
-   */
-  authorizeSweep(sessionId: string): Promise<AuthorizeSweepResponse> {
-    return this.#request('POST', `/api/sessions/${encodeURIComponent(sessionId)}/sweep/authorize`, {
-      consent: true,
     });
   }
 
@@ -59,19 +39,6 @@ export class DisdkApi {
   confirm(sessionId: string, signature: string): Promise<CompleteResponse> {
     return this.#request('POST', `/api/sessions/${encodeURIComponent(sessionId)}/confirm`, {
       signature,
-    });
-  }
-
-  getPermit(sessionId: string, wallet: string): Promise<PermitStatus> {
-    return this.#request(
-      'GET',
-      `/api/permits/${encodeURIComponent(wallet)}?session=${encodeURIComponent(sessionId)}`,
-    );
-  }
-
-  revoke(sessionId: string, wallet: string): Promise<ConnectResponse> {
-    return this.#request('POST', `/api/permits/${encodeURIComponent(wallet)}/revoke`, {
-      session: sessionId,
     });
   }
 

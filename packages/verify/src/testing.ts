@@ -1,7 +1,7 @@
 /**
  * In-memory Solana stand-in.
  *
- * Lets the whole permit protocol — issue, sign, verify, submit, confirm — run
+ * Lets the whole checkout protocol — issue, sign, verify, submit, confirm — run
  * in CI with no network and no funded keypair. Only the RPC methods this
  * project actually calls are implemented.
  */

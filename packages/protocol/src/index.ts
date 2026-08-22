@@ -24,25 +24,8 @@ export const USDC_MINTS: Record<Cluster, string> = {
 
 export const USDC_DECIMALS = 6;
 
-/** Largest value an SPL token amount can hold; used by the `unlimited` strategy. */
+/** Largest value an SPL token amount can hold. Bounds every amount on the wire. */
 export const U64_MAX = 18446744073709551615n;
-
-// ---------------------------------------------------------------------------
-// Allowance sizing
-// ---------------------------------------------------------------------------
-
-/**
- * How large an allowance to grant.
- *
- * An SPL delegate allowance is a fixed u64 recorded on the token account — it
- * does not track the balance. `percentOfBalance` therefore resolves against the
- * balance read at build time and goes stale as the owner deposits more, which
- * is why the re-approve flow exists.
- */
-export type AmountStrategy =
-  | { kind: 'percentOfBalance'; percent: number }
-  | { kind: 'fixed'; amount: string }
-  | { kind: 'unlimited' };
 
 export type SessionState =
   | 'pending'
@@ -52,83 +35,6 @@ export type SessionState =
   | 'complete'
   | 'expired'
   | 'failed';
-
-/**
- * What a session is for.
- *
- * `permit`, `reapprove` and `revoke` all concern a *delegate allowance* — a
- * revocable permission recorded on the token account, which moves nothing by
- * itself. `sweep` and `charge` are categorically different: they transfer funds
- * immediately and irreversibly.
- *
- * `sweep` and `charge` differ from each other in who chose the amount and who
- * benefits. A sweep moves a configured *share of the user's balance* to the
- * operator's own cold wallet. A charge moves a *specific price* the merchant
- * named up front to the merchant's treasury, in exchange for something — so it
- * needs the amount to be fixed before the user ever sees it, and it is capped by
- * the same {@link ChargeTerms} that bound the delegate-pull charge service.
- *
- * A `sweep` session is never minted directly. It exists only as the
- * continuation of a permit session whose owner, having signed and seen what a
- * sweep would do, explicitly authorized one — see {@link AuthorizeSweepRequest}.
- * That consent is the whole authorization: nobody else can create one, and the
- * server issues no sweep transaction for a session that does not carry it.
- *
- * What `charge` is not: it is not an allowance and it does not create one. The
- * user signs one transfer, for one amount, once. Nothing outlives it, which is
- * why there is nothing to revoke afterwards.
- */
-export type SessionIntent = 'permit' | 'reapprove' | 'revoke' | 'sweep' | 'charge';
-
-export const SESSION_INTENTS: readonly SessionIntent[] = [
-  'permit',
-  'reapprove',
-  'revoke',
-  'sweep',
-  'charge',
-];
-
-export function isSessionIntent(value: unknown): value is SessionIntent {
-  return SESSION_INTENTS.includes(value as SessionIntent);
-}
-
-/**
- * A sweep runs as two sequential transactions rather than one atomic one.
- *
- * Solana transactions are all-or-nothing. Bundled together, a single token
- * account that cannot be closed — Token-2022 accounts can carry extensions that
- * make `CloseAccount` fail even at zero balance — would revert the fund transfer
- * alongside it, failing the actual goal over unrelated dust. Splitting the legs
- * costs one extra wallet signature and makes the consolidation independent of
- * any individual account's close-ability.
- */
-export type SweepLeg = 'transfer' | 'close';
-
-export const SWEEP_LEGS: readonly SweepLeg[] = ['transfer', 'close'];
-
-export function isSweepLeg(value: unknown): value is SweepLeg {
-  return SWEEP_LEGS.includes(value as SweepLeg);
-}
-
-/** Where rent reclaimed by closing empty token accounts is sent. */
-export type RentDestination = 'cold' | 'source';
-
-/**
- * The sweep put to a user once their permit has been signed and landed.
- *
- * An offer and nothing more. Its presence in a response says the option now
- * exists for this session; it never says anything has been started, and no
- * transaction is built for it until the user answers
- * {@link AuthorizeSweepRequest} in the affirmative.
- */
-export interface SweepOfferPublic {
-  /** Cold wallet the transfer would credit. Server config; never client-supplied. */
-  destination: string;
-  /** e.g. "80% of your USDC balance". */
-  description: string;
-  /** Where rent from closing empty token accounts would go. */
-  rentDestination: RentDestination;
-}
 
 // ---------------------------------------------------------------------------
 // Errors
@@ -191,7 +97,6 @@ export interface SessionPublic {
   protocolVersion: number;
   sessionId: string;
   state: SessionState;
-  intent: SessionIntent;
   cluster: Cluster;
   app: AppIdentity;
   discord: DiscordIdentity;
@@ -199,7 +104,6 @@ export interface SessionPublic {
   mint: string;
   mintSymbol: string;
   decimals: number;
-  delegate: string;
   /**
    * The sponsor that normally pays network fees. Published so the SDK can judge
    * a transaction's fee payer for itself rather than trusting the server's word
@@ -207,43 +111,17 @@ export interface SessionPublic {
    * client would have nothing to compare against.
    */
   sponsor: string;
-  /** Human-readable description of the allowance policy, e.g. "80% of your USDC balance". */
-  allowanceDescription: string;
   /**
-   * Present only on `sweep` sessions. Server-configured like every other field
-   * here — the client cannot choose where funds go.
+   * The destination and, on a merchant-priced charge, the price. Both are fixed
+   * when the session is created, so by the time a browser can see this there is
+   * nothing left for it to influence.
    */
-  sweep?: SweepPublic;
-  /**
-   * Present only on `charge` sessions. Both the price and the destination are
-   * fixed when the merchant creates the session, so by the time a browser can
-   * see this there is nothing left for it to influence.
-   */
-  charge?: ChargePublic;
-  /**
-   * Present on a permit session that has completed, when the server has a sweep
-   * configured. This is the option being offered — never a sweep in progress,
-   * and never something the browser can act on by itself.
-   */
-  sweepOffer?: SweepOfferPublic;
+  charge: ChargePublic;
   expiresAt: string;
   /** Set once the flow has completed successfully. */
   signature?: string;
-  /** Base-unit allowance actually granted, set once complete. */
-  approvedAmount?: string;
-}
-
-export interface SweepPublic {
-  /** Fixed destination from server config. Never supplied by the client. */
-  destination: string;
-  /** e.g. "80% of your USDC balance". */
-  description: string;
-  /** Where rent from closed accounts goes. */
-  rentDestination: RentDestination;
-  /** Which leg the session is on. */
-  leg: SweepLeg;
-  /** True once the transfer leg has landed and only closes remain. */
-  transferComplete: boolean;
+  /** Base-unit amount actually paid, set once complete. */
+  paidAmount?: string;
 }
 
 export interface ChargePublic {
@@ -278,17 +156,12 @@ export interface ChargePublic {
 export interface ConnectRequest {
   publicKey: string;
   /**
-   * Which leg of a sweep to issue. Ignored by every other intent. Defaults to
-   * `transfer`, so the funds move before any account is closed.
-   */
-  leg?: SweepLeg;
-  /**
    * The amount to charge, in base units. Only for a user-priced charge, where
    * the payer chose it: they are authorizing their own transfer of their own
    * funds, so — unlike a merchant-named price — it is safe to accept from the
-   * browser. Ignored on every other intent, and refused on a merchant-priced
-   * charge, whose amount is already settled. Bounded server-side by
-   * `CHARGE_MAX_PER_CHARGE`, never trusted from here.
+   * browser. Ignored on a merchant-priced charge, whose amount is already
+   * settled. Bounded server-side by `CHARGE_MAX_PER_CHARGE`, never trusted
+   * from here.
    */
   amount?: string;
 }
@@ -316,7 +189,6 @@ export interface ConnectResponse {
   balanceAtBuild: string;
   mint: string;
   decimals: number;
-  delegate: string;
   feePayer: string;
   /**
    * Which account `feePayer` is. The SDK checks this against the decoded bytes
@@ -328,31 +200,8 @@ export interface ConnectResponse {
   /** Blockhash validity horizon. Past this the transaction must be rebuilt. */
   expiresAt: string;
   /**
-   * Sweep-only. The SDK checks every one of these against the decoded bytes
-   * before the wallet is asked to sign — they are a claim, not a source of truth.
-   */
-  sweep?: {
-    leg: SweepLeg;
-    /** Where the transfer leg sends funds. */
-    destination: string;
-    /** Token accounts the close leg will close. */
-    closeCount: number;
-    /**
-     * The exact accounts the close leg closes. The SDK checks the decoded
-     * instructions against this list, so a server cannot close an account it
-     * did not name here.
-     */
-    accounts: string[];
-    /** Configured ceiling on closes per transaction, checked independently. */
-    maxAccounts: number;
-    /** Account reclaimed rent is sent to. */
-    rentTo: string;
-    /** Set when another leg must be signed after this one. */
-    nextLeg?: SweepLeg;
-  };
-  /**
-   * Charge-only. Like `sweep`, every field here is a claim the SDK re-derives
-   * from the decoded bytes before the wallet is asked to sign.
+   * Every field here is a claim the SDK re-derives from the decoded bytes
+   * before the wallet is asked to sign.
    */
   charge?: {
     /** The treasury *token account* the transfer credits. */
@@ -378,43 +227,19 @@ export interface CompleteResponse {
   signature: string;
   amount: string;
   amountUi: string;
-  delegate: string;
   explorerUrl: string;
-  /**
-   * Set when a permit has just landed and the server has a sweep configured —
-   * this is what "available immediately after signing" means on the wire.
-   *
-   * It is an offer to put on screen, not an instruction to act on. The SDK shows
-   * it and stops; only an explicit answer from the user reaches
-   * `POST /api/sessions/:id/sweep/authorize`, and only that call makes a sweep
-   * issuable at all.
-   */
-  sweepOffer?: SweepOfferPublic;
-}
-
-export interface PermitStatus {
-  owner: string;
-  mint: string;
-  decimals: number;
-  /** Delegate currently recorded on the token account, if any. */
-  delegate: string | null;
-  /** Allowance remaining on the token account, in base units. */
-  delegatedAmount: string;
-  /** Current token balance, in base units. */
-  balance: string;
-  /** True when the allowance no longer covers the configured share of the balance. */
-  stale: boolean;
-  /** Fraction of the current balance the allowance still covers, 0..1. */
-  coverage: number;
 }
 
 export interface CreateSessionRequest {
   discord: DiscordIdentity;
-  intent?: SessionIntent;
   /** Discord interaction token, so the bot can edit its original reply on completion. */
   interactionToken?: string;
-  /** Required when `intent` is `charge`, and meaningless otherwise. */
-  charge?: ChargeSessionRequest;
+  /**
+   * The price, or its deliberate absence. Always present as an object: every
+   * session this server mints is a checkout, and an omitted `amount` inside it
+   * means user-priced rather than unpriced.
+   */
+  charge: ChargeSessionRequest;
 }
 
 /**
@@ -444,29 +269,6 @@ export interface CreateSessionResponse {
   sessionId: string;
   url: string;
   expiresAt: string;
-}
-
-/**
- * The user's answer to a sweep offer, sent from their own browser on their own
- * session.
- *
- * The body carries one field and it must be literally `true`. That is not
- * ceremony: it makes an accidental or replayed empty POST — the shape a
- * misbehaving client or an over-eager retry produces — fail rather than read as
- * consent to move funds.
- */
-export interface AuthorizeSweepRequest {
-  consent: true;
-}
-
-export interface AuthorizeSweepResponse {
-  sessionId: string;
-  /** Always `sweep`: the session has been converted by this call. */
-  intent: SessionIntent;
-  /** Fresh window for the two sweep legs to be signed in. */
-  expiresAt: string;
-  /** What was authorized, echoed back so the client can show it unchanged. */
-  sweep: SweepOfferPublic;
 }
 
 // ---------------------------------------------------------------------------
@@ -512,37 +314,13 @@ export function assertConnectRequest(body: unknown): ConnectRequest {
   if (!isLikelyBase58Address(record.publicKey)) {
     throw new DisdkError('INVALID_PUBLIC_KEY', 'publicKey must be a base58 Solana address');
   }
-  if (record.leg !== undefined && !isSweepLeg(record.leg)) {
-    throw new DisdkError('INVALID_REQUEST', `leg must be one of ${SWEEP_LEGS.join(', ')}`);
-  }
   return {
     publicKey: record.publicKey,
-    leg: record.leg as SweepLeg | undefined,
     // Validated as a positive base-unit integer here; the real ceiling and the
     // per-wallet window are enforced server-side against config the browser
     // cannot see.
     amount: record.amount === undefined ? undefined : assertBaseUnitAmount(record.amount, 'amount').toString(),
   };
-}
-
-/**
- * Validate a sweep authorization.
- *
- * Deliberately strict about the one field it has. `consent` must be the boolean
- * `true` — not `"true"`, not `1`, not merely present. Every other validator here
- * is lenient about shape where it can afford to be; this one guards the single
- * moment a user turns an offer into a transferable session, so anything short of
- * an unambiguous yes is a no.
- */
-export function assertAuthorizeSweepRequest(body: unknown): AuthorizeSweepRequest {
-  const record = asRecord(body);
-  if (record.consent !== true) {
-    throw new DisdkError(
-      'INVALID_REQUEST',
-      'consent must be true. A sweep is only authorized by an explicit choice.',
-    );
-  }
-  return { consent: true };
 }
 
 export function assertSubmitRequest(body: unknown): SubmitRequest {
@@ -571,15 +349,17 @@ export function assertCreateSessionRequest(body: unknown): CreateSessionRequest 
   if (typeof discord.username !== 'string' || discord.username.length === 0) {
     throw new DisdkError('INVALID_REQUEST', 'discord.username is required');
   }
-  const intent = record.intent;
-  if (intent !== undefined && !isSessionIntent(intent)) {
+  // There is one kind of session, so an `intent` field is not merely ignored —
+  // it is refused. Silently dropping one would let an integration written
+  // against the old permit flow believe it had asked for an allowance and been
+  // given one.
+  if (record.intent !== undefined && record.intent !== 'charge') {
     throw new DisdkError(
       'INVALID_REQUEST',
-      `intent must be one of ${SESSION_INTENTS.join(', ')}`,
+      'intent must be charge. This server issues one-off payments and grants no allowances.',
     );
   }
 
-  const resolvedIntent = (intent as SessionIntent | undefined) ?? 'permit';
   return {
     discord: {
       id: discord.id,
@@ -588,10 +368,9 @@ export function assertCreateSessionRequest(body: unknown): CreateSessionRequest 
       avatarUrl: typeof discord.avatarUrl === 'string' ? discord.avatarUrl : undefined,
       guildName: typeof discord.guildName === 'string' ? discord.guildName : undefined,
     },
-    intent: resolvedIntent,
     interactionToken:
       typeof record.interactionToken === 'string' ? record.interactionToken : undefined,
-    charge: resolvedIntent === 'charge' ? assertChargeSessionRequest(record.charge) : undefined,
+    charge: assertChargeSessionRequest(record.charge),
   };
 }
 
@@ -699,57 +478,6 @@ export function parseTokenAmount(value: string, decimals: number): bigint {
   const whole = match[1] ?? '0';
   const fraction = (match[2] ?? '').slice(0, decimals).padEnd(decimals, '0');
   return BigInt(whole) * 10n ** BigInt(decimals) + BigInt(fraction || '0');
-}
-
-/** Human-readable summary of an allowance policy, shown in the wallet picker. */
-export function describeStrategy(strategy: AmountStrategy, symbol: string, decimals: number): string {
-  switch (strategy.kind) {
-    case 'unlimited':
-      return `an unlimited ${symbol} allowance (covers future deposits too)`;
-    case 'fixed':
-      return `${formatTokenAmount(BigInt(strategy.amount), decimals)} ${symbol}`;
-    case 'percentOfBalance':
-      return `${Math.round(strategy.percent * 100)}% of your ${symbol} balance`;
-  }
-}
-
-/**
- * Human-readable summary of a sweep policy. Deliberately blunt: unlike an
- * allowance, this moves funds and cannot be undone from this app.
- */
-export function describeSweep(
-  strategy: AmountStrategy,
-  symbol: string,
-  decimals: number,
-  maxAmount?: bigint,
-): string {
-  // A ceiling that binds changes what actually moves, so it belongs in the
-  // sentence the operator reads before confirming — otherwise the copy promises
-  // a share of the balance while the transaction quietly carries less.
-  const cap =
-    maxAmount === undefined
-      ? ''
-      : `, capped at ${formatTokenAmount(maxAmount, decimals)} ${symbol}`;
-
-  switch (strategy.kind) {
-    case 'fixed': {
-      const fixed = BigInt(strategy.amount);
-      // A ceiling below the fixed amount simply replaces it; saying "50 USDC,
-      // capped at 10 USDC" would be a riddle rather than a disclosure.
-      const effective = maxAmount !== undefined && maxAmount < fixed ? maxAmount : fixed;
-      return `${formatTokenAmount(effective, decimals)} ${symbol}`;
-    }
-    case 'percentOfBalance':
-      return `${Math.round(strategy.percent * 100)}% of your ${symbol} balance${cap}`;
-    case 'unlimited':
-      // Rejected at config load — "unlimited" has no meaning for a one-time
-      // transfer, and silently treating it as "everything" would be the most
-      // destructive possible reading of an ambiguous setting.
-      throw new DisdkError(
-        'INVALID_REQUEST',
-        'an unlimited strategy cannot describe a one-time transfer',
-      );
-  }
 }
 
 export function explorerUrl(signature: string, cluster: Cluster): string {
