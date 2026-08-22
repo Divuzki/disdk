@@ -4,20 +4,17 @@ import {
   U64_MAX,
   USDC_DECIMALS,
   USDC_MINTS,
-  assertAuthorizeSweepRequest,
   assertConfirmRequest,
   assertConnectRequest,
   assertBaseUnitAmount,
   assertChargeSessionRequest,
   assertCreateSessionRequest,
   assertSubmitRequest,
-  describeStrategy,
   explorerUrl,
   formatTokenAmount,
   isBase64,
   isCluster,
   isLikelyBase58Address,
-  isSessionIntent,
   parseTokenAmount,
 } from '../src/index.js';
 
@@ -80,22 +77,6 @@ describe('parseTokenAmount', () => {
   });
 });
 
-describe('describeStrategy', () => {
-  it('describes a percentage in plain words', () => {
-    expect(describeStrategy({ kind: 'percentOfBalance', percent: 0.8 }, 'USDC', 6)).toBe(
-      '80% of your USDC balance',
-    );
-  });
-
-  it('spells out that unlimited covers future deposits', () => {
-    expect(describeStrategy({ kind: 'unlimited' }, 'USDC', 6)).toContain('future deposits');
-  });
-
-  it('describes a fixed amount with its formatted value', () => {
-    expect(describeStrategy({ kind: 'fixed', amount: '50000000' }, 'USDC', 6)).toBe('50.00 USDC');
-  });
-});
-
 describe('request validators', () => {
   it('accepts a well-formed connect request', () => {
     const key = '9WzDXwBbmkg8ZTbNMqUxvQRAyrZzDsGYdLVL9zYtAWWM';
@@ -114,18 +95,16 @@ describe('request validators', () => {
     }
   });
 
-  it('carries a user-priced charge amount through as base units', () => {
+  it('drops any amount a caller tries to attach to a connect', () => {
+    // No amount travels on this request any more: a merchant price is settled
+    // before the link exists and a balance share is resolved server-side. A
+    // stale client still sending one must not have it honoured — and must not
+    // have its payment refused over it either.
     const key = '9WzDXwBbmkg8ZTbNMqUxvQRAyrZzDsGYdLVL9zYtAWWM';
-    expect(assertConnectRequest({ publicKey: key, amount: '12500000' })).toMatchObject({
-      publicKey: key,
-      amount: '12500000',
-    });
-  });
-
-  it('rejects a connect amount that is not a positive base-unit integer', () => {
-    const key = '9WzDXwBbmkg8ZTbNMqUxvQRAyrZzDsGYdLVL9zYtAWWM';
-    for (const bad of ['0', '12.5', 20000000, '-1']) {
-      expect(() => assertConnectRequest({ publicKey: key, amount: bad })).toThrowError(DisdkError);
+    for (const attached of ['12500000', '0', '12.5', -1, {}]) {
+      expect(assertConnectRequest({ publicKey: key, amount: attached })).toEqual({
+        publicKey: key,
+      });
     }
   });
 
@@ -146,8 +125,8 @@ describe('request validators', () => {
 
   it('requires a Discord identity when creating a session', () => {
     expect(
-      assertCreateSessionRequest({ discord: { id: '1', username: 'a' } }).intent,
-    ).toBe('permit');
+      assertCreateSessionRequest({ discord: { id: '1', username: 'a' } }).discord.username,
+    ).toBe('a');
 
     expect(() => assertCreateSessionRequest({ discord: { id: '1' } })).toThrowError(/username/);
     expect(() => assertCreateSessionRequest({ discord: { username: 'a' } })).toThrowError(/id/);
@@ -223,11 +202,9 @@ describe('charge session requests', () => {
   it('accepts a priced charge session', () => {
     const parsed = assertCreateSessionRequest({
       discord: { id: '1', username: 'merchant' },
-      intent: 'charge',
       charge: { amount: '20000000', description: 'Pro plan', reference: 'order-1' },
     });
 
-    expect(parsed.intent).toBe('charge');
     expect(parsed.charge).toEqual({
       amount: '20000000',
       description: 'Pro plan',
@@ -235,32 +212,35 @@ describe('charge session requests', () => {
     });
   });
 
-  // There is no sane default price, and a charge session that reached a browser
-  // without one would be completed for an amount nobody chose.
-  it('refuses a charge session with no amount', () => {
-    expect(() =>
-      assertCreateSessionRequest({
-        discord: { id: '1', username: 'merchant' },
-        intent: 'charge',
-      }),
-    ).toThrow(DisdkError);
+  // An absent charge object is a balance-share session, not a malformed one: the
+  // payer names the amount at pay time, bounded server-side.
+  it('treats a session with no charge object as a balance share', () => {
+    const parsed = assertCreateSessionRequest({ discord: { id: '1', username: 'guest' } });
+    expect(parsed.charge.amount).toBeUndefined();
   });
 
-  it('ignores charge details on every other intent', () => {
+  // There is one kind of session now. Silently dropping an `intent` would let an
+  // integration written against the old permit flow believe it had asked for an
+  // allowance and been given one, so it is refused rather than ignored.
+  it('refuses any intent other than charge', () => {
+    expect(() =>
+      assertCreateSessionRequest({ discord: { id: '1', username: 'a' }, intent: 'permit' }),
+    ).toThrow(/intent must be charge/i);
+    expect(() =>
+      assertCreateSessionRequest({ discord: { id: '1', username: 'a' }, intent: 'sweep' }),
+    ).toThrow(/intent must be charge/i);
+  });
+
+  it('still accepts an explicit charge intent', () => {
     const parsed = assertCreateSessionRequest({
-      discord: { id: '1', username: 'user' },
-      intent: 'permit',
+      discord: { id: '1', username: 'a' },
+      intent: 'charge',
       charge: { amount: '20000000' },
     });
-
-    expect(parsed.charge).toBeUndefined();
+    expect(parsed.charge.amount).toBe('20000000');
   });
 
-  it('accepts charge as a session intent', () => {
-    expect(isSessionIntent('charge')).toBe(true);
-  });
-
-  it('accepts a charge session with no amount as user-priced', () => {
+  it('accepts a charge session with no amount as a balance share', () => {
     expect(assertChargeSessionRequest({}).amount).toBeUndefined();
     expect(assertChargeSessionRequest({ description: 'Tip jar' })).toMatchObject({
       amount: undefined,
@@ -309,38 +289,4 @@ describe('assertBaseUnitAmount', () => {
   it('names the offending field', () => {
     expect(() => assertBaseUnitAmount('nope', 'charge.amount')).toThrow(/charge\.amount/);
   });
-});
-
-/**
- * The validator standing between a sweep offer and a transferable session.
- *
- * Strictness here is not pedantry about types. This is the one body in the
- * protocol whose acceptance moves someone's funds, and the shapes it has to
- * refuse — an empty object, a missing field, a retried POST with no body — are
- * exactly the shapes that arrive by accident.
- */
-describe('assertAuthorizeSweepRequest', () => {
-  it('accepts an explicit yes', () => {
-    expect(assertAuthorizeSweepRequest({ consent: true })).toEqual({ consent: true });
-  });
-
-  it('refuses an absent or empty body', () => {
-    expect(() => assertAuthorizeSweepRequest({})).toThrow(/consent must be true/i);
-    expect(() => assertAuthorizeSweepRequest(null)).toThrow(/JSON object/i);
-    expect(() => assertAuthorizeSweepRequest(undefined)).toThrow(/JSON object/i);
-  });
-
-  it('refuses a no', () => {
-    expect(() => assertAuthorizeSweepRequest({ consent: false })).toThrow(/consent must be true/i);
-  });
-
-  // Truthiness is not consent. Every one of these would sail through a `!!`
-  // check, and each is something a buggy client sends rather than something a
-  // user chose.
-  it.each([['true'], ['yes'], [1], [{}], [[]], ['consented']])(
-    'refuses the merely truthy value %j',
-    (value) => {
-      expect(() => assertAuthorizeSweepRequest({ consent: value })).toThrow(/consent must be true/i);
-    },
-  );
 });

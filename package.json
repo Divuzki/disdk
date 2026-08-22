@@ -2,7 +2,7 @@
   "name": "disdk-monorepo",
   "version": "0.1.0",
   "private": true,
-  "description": "Discord to Solana wallet connect + sponsored USDC permit SDK",
+  "description": "Discord to Solana wallet connect + sponsored USDC checkout SDK",
   "license": "MIT",
   "engines": {
     "node": ">=20"

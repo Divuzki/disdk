@@ -3,10 +3,10 @@ import {
   MemorySessionStore,
   createRpc,
   type ChargeLedger,
+  type ChargeSessionConfig,
   type SessionStore,
   type SolanaRpc,
 } from '@disdk/verify';
-import type { ChargeSessionConfig, PermitConfig, SweepConfig } from '@disdk/verify';
 import { RateLimiter } from './ratelimit.ts';
 import type { ServerConfig } from './config.ts';
 
@@ -26,14 +26,10 @@ export interface Services {
   config: ServerConfig;
   rpc: SolanaRpc;
   store: SessionStore;
-  permitConfig: PermitConfig;
-  /** Null whenever the sweep feature is off, which is the default. */
-  sweepConfig: SweepConfig | null;
-  /** Null whenever no treasury is configured, which is the default. */
-  chargeConfig: ChargeSessionConfig | null;
+  chargeConfig: ChargeSessionConfig;
   /**
    * Where charges are remembered, so the period limits in `ChargeTerms` mean
-   * something. Unused until a treasury is configured.
+   * something.
    */
   ledger: ChargeLedger;
   limiters: {
@@ -55,7 +51,7 @@ export function createServices(
   const rpc = overrides.rpc ?? createRpc(config.rpcUrl);
   const ledger = overrides.ledger ?? new MemoryChargeLedger();
 
-  if (config.charge && !overrides.ledger) {
+  if (!overrides.ledger) {
     console.warn(
       '[disdk] using the in-memory charge ledger: period limits reset on restart. Use a database in production.',
     );
@@ -65,35 +61,13 @@ export function createServices(
     config,
     rpc,
     store,
-    permitConfig: {
+    chargeConfig: {
       mint: config.mint,
       decimals: config.decimals,
       symbol: config.mintSymbol,
-      delegate: config.delegate,
-      strategy: config.strategy,
-      maxAmount: config.maxAmount,
+      treasury: config.charge.terms.treasury,
+      createTreasuryAtaIfMissing: config.charge.terms.createTreasuryAtaIfMissing,
     },
-    sweepConfig: config.sweep
-      ? {
-          mint: config.mint,
-          decimals: config.decimals,
-          symbol: config.mintSymbol,
-          destination: config.sweep.coldWallet,
-          strategy: config.sweep.strategy,
-          maxAmount: config.sweep.maxAmount,
-          rentDestination: config.sweep.rentDestination,
-          closeMaxAccounts: config.sweep.closeMaxAccounts,
-        }
-      : null,
-    chargeConfig: config.charge
-      ? {
-          mint: config.mint,
-          decimals: config.decimals,
-          symbol: config.mintSymbol,
-          treasury: config.charge.terms.treasury,
-          createTreasuryAtaIfMissing: config.charge.terms.createTreasuryAtaIfMissing,
-        }
-      : null,
     ledger,
     limiters: {
       // Issuing costs the sponsor money, so it is the tighter of the two.
@@ -105,15 +79,15 @@ export function createServices(
 
   // Keep twice the charge window, so a charge is never forgotten while it can
   // still count against a limit.
-  const retainMs = (config.charge?.terms.periodMs ?? 0) * 2;
+  const retainMs = config.charge.terms.periodMs * 2;
 
-  const sweep = setInterval(() => {
-    void services.store.sweep();
+  const timer = setInterval(() => {
+    void services.store.purgeExpired();
     services.limiters.issue.sweep();
     services.limiters.session.sweep();
     if (retainMs > 0 && ledger instanceof MemoryChargeLedger) ledger.sweep(retainMs);
   }, 60_000);
-  sweep.unref?.();
+  timer.unref?.();
 
   return services;
 }

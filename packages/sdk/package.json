@@ -1,7 +1,7 @@
 {
   "name": "@disdk/sdk",
   "version": "0.1.0",
-  "description": "Drop-in browser SDK: connect a Solana wallet from a Discord link and grant a sponsored USDC allowance",
+  "description": "Drop-in browser SDK: connect a Solana wallet from a Discord link and pay USDC with the fee sponsored",
   "license": "MIT",
   "type": "module",
   "main": "./dist/index.cjs",

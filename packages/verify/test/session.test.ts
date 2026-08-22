@@ -12,7 +12,7 @@ const discord: DiscordIdentity = { id: '1234567890', username: 'someone' };
 
 async function makeSession(ttlMs = 10 * 60 * 1000) {
   const store = new MemorySessionStore();
-  const { sessionId, record } = await store.create({ discord, intent: 'permit', ttlMs });
+  const { sessionId, record } = await store.create({ discord, ttlMs });
   return { store, sessionId, record };
 }
 
@@ -80,11 +80,11 @@ describe('session lifecycle', () => {
       await store.update(sessionId, { state: 'complete', signature: 'sig' });
 
       vi.advanceTimersByTime(5 * 60 * 1000);
-      await store.sweep();
+      await store.purgeExpired();
       expect((await store.get(sessionId))?.state).toBe('complete');
 
       vi.advanceTimersByTime(2 * 60 * 60 * 1000);
-      await store.sweep();
+      await store.purgeExpired();
       expect(await store.get(sessionId)).toBeNull();
     } finally {
       vi.useRealTimers();
@@ -95,12 +95,12 @@ describe('session lifecycle', () => {
     vi.useFakeTimers();
     try {
       const store = new MemorySessionStore();
-      await store.create({ discord, intent: 'permit', ttlMs: 1000 });
-      await store.create({ discord, intent: 'permit', ttlMs: 1000 });
+      await store.create({ discord, ttlMs: 1000 });
+      await store.create({ discord, ttlMs: 1000 });
       expect(store.size).toBe(2);
 
       vi.advanceTimersByTime(1001);
-      expect(await store.sweep()).toBe(2);
+      expect(await store.purgeExpired()).toBe(2);
       expect(store.size).toBe(0);
     } finally {
       vi.useRealTimers();

@@ -22,6 +22,7 @@ import {
   type FeePayerRole,
 } from '@disdk/protocol';
 import { deriveAta, readTokenAccount } from './token.js';
+import { resolveChargeAmount, type ChargeAmount } from './amount.js';
 import { withRpc, type SolanaRpc } from './rpc.js';
 
 /** SPL Memo v2. Inert — it cannot move funds or touch accounts. */
@@ -60,11 +61,8 @@ export interface BuildOptions {
 /**
  * Everything a charge needs, all of it server configuration except the amount —
  * and that comes either from the merchant-authenticated call that created the
- * session or, on a user-priced charge, from the payer naming their own price.
- * Never from an unauthenticated browser claiming to speak for a merchant.
- *
- * A charge is a price, not a policy. It is decided before the transaction is
- * built, and the build step's job is to refuse anything that does not match it.
+ * session or, on a balance share, from the payer's own balance read here. Never
+ * from a browser, on either path.
  */
 export interface ChargeSessionConfig {
   mint: Address;
@@ -187,13 +185,18 @@ export async function buildChargePaymentTransaction(
   rpc: SolanaRpc,
   sponsor: TransactionSigner,
   owner: Address,
-  amount: bigint,
+  /**
+   * A settled price, or a share of the payer's balance. A share cannot become a
+   * figure until the balance below has been read, which is why this is resolved
+   * here rather than by the caller.
+   */
+  requested: ChargeAmount,
   config: ChargeSessionConfig,
   sessionNonce?: string,
   reference?: string,
   options: BuildOptions = {},
 ): Promise<BuiltTransaction> {
-  if (amount <= 0n) {
+  if (typeof requested === 'bigint' && requested <= 0n) {
     throw new DisdkError('AMOUNT_TOO_SMALL', 'A charge must be greater than zero.');
   }
 
@@ -207,6 +210,9 @@ export async function buildChargePaymentTransaction(
       `This wallet has no ${config.symbol} token account.`,
     );
   }
+
+  const amount = resolveChargeAmount(requested, view.balance);
+
   if (view.balance < amount) {
     // The transfer would fail on chain anyway. Failing here says why, and does
     // it before the sponsor pays a fee to find out.

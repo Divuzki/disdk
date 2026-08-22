@@ -24,7 +24,7 @@ import {
   getTransferCheckedInstruction,
   getTransferInstruction,
 } from '@solana-program/token';
-import { verifyChargeTransfer } from '../src/txguard.js';
+import { verifyChargeTransaction } from '../src/txguard.js';
 
 const MINT = address('4zMMC9srt5Ri5X14GAgXhaHii3GnPAEERYPJgZJDncDU');
 const OTHER_MINT = address('So11111111111111111111111111111111111111112');
@@ -87,12 +87,12 @@ async function setup() {
   };
 }
 
-describe('verifyChargeTransfer', () => {
+describe('verifyChargeTransaction', () => {
   it('accepts the payment it was promised', async () => {
     const { sponsor, owner, expectation } = await setup();
     const tx = await buildTx([transferIx(owner.address)], sponsor);
 
-    const verified = verifyChargeTransfer(tx, expectation);
+    const verified = verifyChargeTransaction(tx, expectation);
     expect(verified.amount).toBe(AMOUNT);
     expect(verified.destination).toBe(TREASURY_ATA);
     expect(verified.owner).toBe(owner.address);
@@ -123,7 +123,7 @@ describe('verifyChargeTransfer', () => {
       sponsor,
     );
 
-    expect(() => verifyChargeTransfer(tx, expectation)).toThrowError(/spending allowance/i);
+    expect(() => verifyChargeTransaction(tx, expectation)).toThrowError(/spending allowance/i);
   });
 
   it('refuses the unchecked approval variant just as firmly', async () => {
@@ -141,7 +141,7 @@ describe('verifyChargeTransfer', () => {
       sponsor,
     );
 
-    expect(() => verifyChargeTransfer(tx, expectation)).toThrowError(/spending allowance/i);
+    expect(() => verifyChargeTransaction(tx, expectation)).toThrowError(/spending allowance/i);
   });
 
   // Not obviously an attack, which is exactly why it is listed. A payment has no
@@ -157,7 +157,7 @@ describe('verifyChargeTransfer', () => {
       sponsor,
     );
 
-    expect(() => verifyChargeTransfer(tx, expectation)).toThrowError(/changes an allowance/i);
+    expect(() => verifyChargeTransaction(tx, expectation)).toThrowError(/changes an allowance/i);
   });
 
   it('refuses a payment that also closes an account', async () => {
@@ -174,7 +174,7 @@ describe('verifyChargeTransfer', () => {
       sponsor,
     );
 
-    expect(() => verifyChargeTransfer(tx, expectation)).toThrowError(/close a token account/i);
+    expect(() => verifyChargeTransaction(tx, expectation)).toThrowError(/close a token account/i);
   });
 
   it('refuses a second transfer hidden behind the first', async () => {
@@ -187,21 +187,21 @@ describe('verifyChargeTransfer', () => {
       sponsor,
     );
 
-    expect(() => verifyChargeTransfer(tx, expectation)).toThrowError(/more than one transfer/i);
+    expect(() => verifyChargeTransaction(tx, expectation)).toThrowError(/more than one transfer/i);
   });
 
   it('refuses a payment redirected to another account', async () => {
     const { sponsor, owner, expectation } = await setup();
     const tx = await buildTx([transferIx(owner.address, { destination: ATTACKER })], sponsor);
 
-    expect(() => verifyChargeTransfer(tx, expectation)).toThrowError(/unexpected destination/i);
+    expect(() => verifyChargeTransaction(tx, expectation)).toThrowError(/unexpected destination/i);
   });
 
   it('refuses a larger amount than the one displayed', async () => {
     const { sponsor, owner, expectation } = await setup();
     const tx = await buildTx([transferIx(owner.address, { amount: AMOUNT * 10n })], sponsor);
 
-    expect(() => verifyChargeTransfer(tx, expectation)).toThrowError(/does not match/i);
+    expect(() => verifyChargeTransaction(tx, expectation)).toThrowError(/does not match/i);
   });
 
   // A smaller amount is refused too. This guard's job is not "stop the user
@@ -211,14 +211,14 @@ describe('verifyChargeTransfer', () => {
     const { sponsor, owner, expectation } = await setup();
     const tx = await buildTx([transferIx(owner.address, { amount: 1n })], sponsor);
 
-    expect(() => verifyChargeTransfer(tx, expectation)).toThrowError(/does not match/i);
+    expect(() => verifyChargeTransaction(tx, expectation)).toThrowError(/does not match/i);
   });
 
   it('refuses a different token', async () => {
     const { sponsor, owner, expectation } = await setup();
     const tx = await buildTx([transferIx(owner.address, { mint: OTHER_MINT })], sponsor);
 
-    expect(() => verifyChargeTransfer(tx, expectation)).toThrowError(/different token/i);
+    expect(() => verifyChargeTransaction(tx, expectation)).toThrowError(/different token/i);
   });
 
   it('refuses a transfer from a different wallet', async () => {
@@ -226,7 +226,7 @@ describe('verifyChargeTransfer', () => {
     const other = await generateKeyPairSigner();
     const tx = await buildTx([transferIx(other.address)], sponsor);
 
-    expect(() => verifyChargeTransfer(tx, expectation)).toThrowError(/different wallet/i);
+    expect(() => verifyChargeTransaction(tx, expectation)).toThrowError(/different wallet/i);
   });
 
   // The unchecked variant carries no mint account, so the token program itself
@@ -245,14 +245,14 @@ describe('verifyChargeTransfer', () => {
       sponsor,
     );
 
-    expect(() => verifyChargeTransfer(tx, expectation)).toThrowError(/unchecked transfer/i);
+    expect(() => verifyChargeTransaction(tx, expectation)).toThrowError(/unchecked transfer/i);
   });
 
   it('refuses mismatched decimals', async () => {
     const { sponsor, owner, expectation } = await setup();
     const tx = await buildTx([transferIx(owner.address, { decimals: 9 })], sponsor);
 
-    expect(() => verifyChargeTransfer(tx, expectation)).toThrowError(/unexpected token decimals/i);
+    expect(() => verifyChargeTransaction(tx, expectation)).toThrowError(/unexpected token decimals/i);
   });
 
   it('refuses a transaction paid for by an unexpected account', async () => {
@@ -260,7 +260,7 @@ describe('verifyChargeTransfer', () => {
     const stranger = await generateKeyPairSigner();
     const tx = await buildTx([transferIx(owner.address)], stranger);
 
-    expect(() => verifyChargeTransfer(tx, expectation)).toThrowError(/unexpected account/i);
+    expect(() => verifyChargeTransaction(tx, expectation)).toThrowError(/unexpected account/i);
   });
 
   it('refuses an unrecognised token instruction such as a burn', async () => {
@@ -278,7 +278,7 @@ describe('verifyChargeTransfer', () => {
       sponsor,
     );
 
-    expect(() => verifyChargeTransfer(tx, expectation)).toThrowError(
+    expect(() => verifyChargeTransaction(tx, expectation)).toThrowError(
       /unexpected token instruction/i,
     );
   });
@@ -287,13 +287,13 @@ describe('verifyChargeTransfer', () => {
     const { sponsor, expectation } = await setup();
     const tx = await buildTx([], sponsor);
 
-    expect(() => verifyChargeTransfer(tx, expectation)).toThrowError(/no transfer/i);
+    expect(() => verifyChargeTransaction(tx, expectation)).toThrowError(/no transfer/i);
   });
 
   it('refuses input that is not a transaction', async () => {
     const { expectation } = await setup();
 
-    expect(() => verifyChargeTransfer('not-base64-at-all!!', expectation)).toThrowError(
+    expect(() => verifyChargeTransaction('not-base64-at-all!!', expectation)).toThrowError(
       /could not be decoded/i,
     );
   });

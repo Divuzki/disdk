@@ -83,12 +83,13 @@ async function handleCommand(
 }
 
 /**
- * Mint a user-priced checkout session and hand back the link.
+ * Mint a checkout session with no merchant price, and hand back the link.
  *
- * No confirmation step and no operator allowlist: the payer chooses the amount
- * and signs it themselves on the review screen, so there is nothing here to
- * gate. The reply is ephemeral because the link is a bearer token for one
- * person's session and must not sit in a public channel for anyone to click.
+ * No confirmation step and no operator allowlist: nobody here can name a price
+ * for somebody else to pay, and the payer signs the transfer themselves while
+ * looking at the resolved amount. The reply is ephemeral because the link is a
+ * bearer token for one person's session and must not sit in a public channel
+ * for anyone to click.
  */
 async function sendPayLink(
   interaction: ChatInputCommandInteraction,
@@ -112,7 +113,8 @@ async function sendPayLink(
         guildName: interaction.guild?.name,
       },
       intent: 'charge',
-      // No amount: this is a user-priced charge. The payer names it at pay time.
+      // No amount: the server prices this from the payer's balance at connect
+      // time. Nothing the bot knows could price it, and nothing should.
       charge: {},
       interactionToken: interaction.token,
     }),

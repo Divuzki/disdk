@@ -17,7 +17,6 @@ import { createServices } from '../src/services.ts';
 import type { Hono } from 'hono';
 
 const MINT = address(USDC_MINTS['solana:devnet']);
-const DELEGATE = address('9WzDXwBbmkg8ZTbNMqUxvQRAyrZzDsGYdLVL9zYtAWWM');
 const TREASURY = address('GDfnEsia2WLAW5t8yx2X5j2mkfA74i5kwGdDuZHt7XmG');
 const BOT_SECRET = 'test-bot-secret';
 const ORIGIN = 'http://localhost:5173';
@@ -34,11 +33,13 @@ interface Harness {
   config: Awaited<ReturnType<typeof loadConfig>>;
 }
 
-async function harness(envOverrides: Record<string, string> = {}): Promise<Harness> {
+async function harness(
+  envOverrides: Record<string, string> = {},
+  balance = BALANCE,
+): Promise<Harness> {
   const sponsor = await generateSponsorKeypair();
   const config = await loadConfig({
     CLUSTER: 'solana:devnet',
-    DELEGATE_PUBKEY: DELEGATE,
     SPONSOR_SECRET_KEY: sponsor.secretKeyBase64,
     BOT_API_SECRET: BOT_SECRET,
     APP_ORIGIN: ORIGIN,
@@ -49,7 +50,7 @@ async function harness(envOverrides: Record<string, string> = {}): Promise<Harne
 
   const mock = createMockRpc();
   const owner = await generateKeyPairSigner();
-  await mockTokenAccountFor(mock, owner.address, MINT, BALANCE);
+  await mockTokenAccountFor(mock, owner.address, MINT, balance);
   await mockTokenAccountFor(mock, TREASURY, MINT, 0n);
 
   const services = createServices(config, { rpc: mock.rpc });
@@ -66,7 +67,6 @@ async function createCharge(
     headers: { 'content-type': 'application/json', 'x-disdk-bot-secret': BOT_SECRET },
     body: JSON.stringify({
       discord: { id: discordId, username: 'merchant' },
-      intent: 'charge',
       ...(charge ? { charge } : {}),
     }),
   });
@@ -114,12 +114,19 @@ async function pay(h: Harness, id: string): Promise<Response> {
 }
 
 describe('charge configuration', () => {
-  it('leaves the feature off when no treasury is configured', async () => {
-    const h = await harness({ TREASURY_ADDRESS: '' });
-    const response = await createCharge(h.app, { amount: PRICE });
-
-    expect(response.status).toBe(401);
-    expect(await response.json()).toMatchObject({ error: 'UNAUTHORIZED' });
+  // There is nothing else this server does, so a missing destination is not a
+  // disabled feature — it is a server that would take payments with nowhere to
+  // put them.
+  it('refuses to boot with no treasury at all', async () => {
+    const sponsor = await generateSponsorKeypair();
+    await expect(
+      loadConfig({
+        CLUSTER: 'solana:devnet',
+        SPONSOR_SECRET_KEY: sponsor.secretKeyBase64,
+        BOT_API_SECRET: BOT_SECRET,
+        CHARGE_MAX_PER_CHARGE: '50000000',
+      } as NodeJS.ProcessEnv),
+    ).rejects.toThrow(/TREASURY_ADDRESS is required/i);
   });
 
   // Without a per-charge ceiling the only bound on a charge is the user's
@@ -130,7 +137,6 @@ describe('charge configuration', () => {
     await expect(
       loadConfig({
         CLUSTER: 'solana:devnet',
-        DELEGATE_PUBKEY: DELEGATE,
         SPONSOR_SECRET_KEY: sponsor.secretKeyBase64,
         BOT_API_SECRET: BOT_SECRET,
         TREASURY_ADDRESS: TREASURY,
@@ -144,7 +150,9 @@ describe('charge configuration', () => {
     ).rejects.toThrow(/can never be reached/i);
   });
 
-  it('still serves ordinary permit sessions while checkout is enabled', async () => {
+  // Refused rather than ignored: an integration written against the old permit
+  // flow must not be able to believe it asked for an allowance and got one.
+  it('refuses a session asking for any other intent', async () => {
     const h = await harness();
     const response = await h.app.request('/api/sessions', {
       method: 'POST',
@@ -152,7 +160,8 @@ describe('charge configuration', () => {
       body: JSON.stringify({ discord: { id: '1', username: 'user' }, intent: 'permit' }),
     });
 
-    expect(response.status).toBe(201);
+    expect(response.status).toBe(400);
+    expect(await response.json()).toMatchObject({ message: /intent must be charge/i });
   });
 });
 
@@ -172,12 +181,18 @@ describe('charge session creation', () => {
     expect(response.status).toBe(401);
   });
 
-  it('requires an amount', async () => {
+  // An omitted charge object is not a malformed request: it is a session with no
+  // merchant price, which is priced from the payer's balance instead. What it
+  // must never be is a session with no price *and* no way to arrive at one.
+  it('treats an omitted charge object as a balance share', async () => {
     const h = await harness();
     const response = await createCharge(h.app, undefined);
+    expect(response.status).toBe(201);
 
-    expect(response.status).toBe(400);
-    expect(await response.json()).toMatchObject({ error: 'INVALID_REQUEST' });
+    const { sessionId: id } = await readJson<{ sessionId: string }>(response);
+    const view = await readJson(await h.app.request(`/api/sessions/${encodeURIComponent(id)}`));
+    expect(view.charge).toMatchObject({ pricing: 'balanceShare', treasury: TREASURY });
+    expect(view.charge.amount).toBeUndefined();
   });
 
   it('refuses a zero amount', async () => {
@@ -231,7 +246,6 @@ describe('charge session view', () => {
 
     const view = await readJson(await h.app.request(`/api/sessions/${encodeURIComponent(id)}`));
 
-    expect(view.intent).toBe('charge');
     expect(view.charge).toMatchObject({
       treasury: TREASURY,
       amount: PRICE,
@@ -241,17 +255,17 @@ describe('charge session view', () => {
     });
   });
 
-  it('does not attach charge details to an ordinary permit session', async () => {
+  // Nothing about a delegate reaches the browser, because there is no longer
+  // one to name. A client still reading this field is a client still expecting
+  // an allowance.
+  it('publishes no delegate or allowance policy', async () => {
     const h = await harness();
-    const created = await h.app.request('/api/sessions', {
-      method: 'POST',
-      headers: { 'content-type': 'application/json', 'x-disdk-bot-secret': BOT_SECRET },
-      body: JSON.stringify({ discord: { id: '1', username: 'user' }, intent: 'permit' }),
-    });
-    const { sessionId: id } = await readJson<{ sessionId: string }>(created);
+    const id = await sessionId(h.app);
 
     const view = await readJson(await h.app.request(`/api/sessions/${encodeURIComponent(id)}`));
-    expect(view.charge).toBeUndefined();
+    expect(view.delegate).toBeUndefined();
+    expect(view.allowanceDescription).toBeUndefined();
+    expect(view.intent).toBeUndefined();
   });
 });
 
@@ -400,50 +414,64 @@ describe('charge terms', () => {
 });
 
 /**
- * User-priced checkout: the session is minted with no amount, and the payer
- * names it at connect time. This is the `/pay` path — reachable by anyone, no
- * operator allowlist — so the ceiling and the per-wallet window are the only
- * bounds, and they are enforced here rather than at session creation.
+ * Balance-share checkout: the session is minted with no amount, and the figure
+ * is a share of whatever the payer holds when they connect. This is the `/pay`
+ * path — reachable by anyone, no operator allowlist — so the per-charge ceiling
+ * and the rolling window are the only bounds, and nothing the browser sends can
+ * move them.
+ *
+ * The share is capped *down* to those bounds rather than refused by them: a
+ * limit exists to bound a charge, and 80% of an ordinary balance sits above most
+ * deployments' per-charge ceiling.
  */
-describe('user-priced checkout', () => {
-  /** Mint a session with no fixed price. */
+describe('balance-share checkout', () => {
+  /** 2,500,000 USDC, so the shipped 1,000,000 share cap is what bites. */
+  const WHALE_BALANCE = 2_500_000_000_000n;
+
+  /** Mint a session with no merchant price. */
   async function openSessionId(app: Hono): Promise<string> {
     const response = await createCharge(app, {});
     expect(response.status).toBe(201);
     return (await readJson<{ sessionId: string }>(response)).sessionId;
   }
 
-  function connectWithAmount(app: Hono, id: string, publicKey: string, amount?: string) {
+  function connectWith(
+    app: Hono,
+    id: string,
+    publicKey: string,
+    extra: Record<string, unknown> = {},
+  ) {
     return app.request(`/api/sessions/${encodeURIComponent(id)}/connect`, {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ publicKey, ...(amount ? { amount } : {}) }),
+      body: JSON.stringify({ publicKey, ...extra }),
     });
   }
 
-  it('advertises itself as user-priced, with the ceiling, and no amount', async () => {
+  it('advertises the rule, the ceiling, and no amount', async () => {
     const h = await harness();
     const id = await openSessionId(h.app);
 
-    const view = await readJson(
-      await h.app.request(`/api/sessions/${encodeURIComponent(id)}`),
-    );
+    const view = await readJson(await h.app.request(`/api/sessions/${encodeURIComponent(id)}`));
 
-    expect(view.charge.userPriced).toBe(true);
+    expect(view.charge.pricing).toBe('balanceShare');
     expect(view.charge.amount).toBeUndefined();
+    expect(view.charge.share).toEqual({ percent: 0.8, maxAmount: '1000000000000' });
     expect(view.charge.maxAmount).toBe('50000000');
     expect(view.charge.treasury).toBe(TREASURY);
   });
 
-  it('charges exactly the amount the payer chose', async () => {
-    const h = await harness();
+  it('charges 80% of the balance when the ceiling leaves room for it', async () => {
+    // 1,000 USDC held, ceiling above the share: 800 USDC.
+    const h = await harness({ CHARGE_MAX_PER_CHARGE: '1000000000' });
     const id = await openSessionId(h.app);
 
-    const issued = await connectWithAmount(h.app, id, h.owner.address, '12500000');
+    const issued = await connectWith(h.app, id, h.owner.address);
     expect(issued.status).toBe(200);
     const body = await readJson(issued);
-    expect(body.amount).toBe('12500000');
-    expect(body.amountUi).toBe('12.50');
+    expect(body.amount).toBe('800000000');
+    expect(body.amountUi).toBe('800.00');
+    expect(body.balanceAtBuild).toBe('1000000000');
 
     const submit = await h.app.request(`/api/sessions/${encodeURIComponent(id)}/submit`, {
       method: 'POST',
@@ -451,43 +479,82 @@ describe('user-priced checkout', () => {
       body: JSON.stringify({ signedTransaction: await walletSign(body.transaction, h.owner) }),
     });
     expect(submit.status).toBe(200);
-    expect((await readJson(submit)).amount).toBe('12500000');
+    expect((await readJson(submit)).amount).toBe('800000000');
   });
 
-  it('refuses a chosen amount above the per-charge ceiling', async () => {
+  it('honours a percentage other than the default', async () => {
+    const h = await harness({
+      CHARGE_MAX_PER_CHARGE: '1000000000',
+      CHARGE_PERCENT_OF_BALANCE: '0.5',
+    });
+    const id = await openSessionId(h.app);
+
+    expect((await readJson(await connectWith(h.app, id, h.owner.address))).amount).toBe('500000000');
+  });
+
+  it('clamps to the per-charge ceiling instead of refusing the payment', async () => {
+    // 80% of 1,000 USDC is 800, far above the 50 USDC ceiling. The payer is
+    // charged the ceiling — refusing here would fail every ordinary wallet.
     const h = await harness();
     const id = await openSessionId(h.app);
 
-    // Ceiling is 50 USDC; ask for 60.
-    const response = await connectWithAmount(h.app, id, h.owner.address, '60000000');
-    expect(response.status).toBe(402);
-    expect(await readJson(response)).toMatchObject({ error: 'CHARGE_REFUSED' });
+    const issued = await connectWith(h.app, id, h.owner.address);
+    expect(issued.status).toBe(200);
+    expect((await readJson(issued)).amount).toBe('50000000');
   });
 
-  it('refuses a user-priced connect that carries no amount', async () => {
+  it('clamps to the 1,000,000 USDC share cap', async () => {
+    // 80% of 2.5M USDC is 2M, above the shipped cap, and the per-charge ceiling
+    // is set higher still so the cap is the only thing that can bite.
+    const h = await harness({ CHARGE_MAX_PER_CHARGE: '9000000000000' }, WHALE_BALANCE);
+    const id = await openSessionId(h.app);
+
+    const issued = await connectWith(h.app, id, h.owner.address);
+    expect(issued.status).toBe(200);
+    expect((await readJson(issued)).amount).toBe('1000000000000');
+  });
+
+  it('honours a lower share cap when one is configured', async () => {
+    const h = await harness(
+      { CHARGE_MAX_PER_CHARGE: '9000000000000', CHARGE_SHARE_MAX_AMOUNT: '100000000' },
+      WHALE_BALANCE,
+    );
+    const id = await openSessionId(h.app);
+
+    expect((await readJson(await connectWith(h.app, id, h.owner.address))).amount).toBe('100000000');
+  });
+
+  it('needs no amount from the browser, and ignores one that is sent', async () => {
     const h = await harness();
     const id = await openSessionId(h.app);
 
-    const response = await connectWithAmount(h.app, id, h.owner.address);
+    // A stale client posting its own figure gets the server's, not its own.
+    const issued = await connectWith(h.app, id, h.owner.address, { amount: '1' });
+    expect(issued.status).toBe(200);
+    expect((await readJson(issued)).amount).toBe('50000000');
+  });
+
+  it('refuses a wallet with nothing in it', async () => {
+    const h = await harness({}, 0n);
+    const id = await openSessionId(h.app);
+
+    const response = await connectWith(h.app, id, h.owner.address);
     expect(response.status).toBe(400);
-    expect(await readJson(response)).toMatchObject({ error: 'INVALID_REQUEST' });
+    expect(await readJson(response)).toMatchObject({ error: 'INSUFFICIENT_BALANCE' });
   });
 
-  it('rejects a zero or negative chosen amount at the validator', async () => {
-    const h = await harness();
-    const id = await openSessionId(h.app);
+  it('clamps to what the rolling per-wallet window still allows', async () => {
+    const h = await harness({
+      CHARGE_MAX_PER_CHARGE: '20000000',
+      CHARGE_MAX_PER_PERIOD: '30000000',
+    });
 
-    expect((await connectWithAmount(h.app, id, h.owner.address, '0')).status).toBe(400);
-  });
-
-  it('respects the rolling per-wallet window for chosen amounts', async () => {
-    const h = await harness({ CHARGE_MAX_PER_CHARGE: '20000000', CHARGE_MAX_PER_PERIOD: '30000000' });
-
-    // First payment of 20 USDC lands.
+    // First payment takes the per-charge ceiling, 20 USDC.
     const first = await openSessionId(h.app);
-    const a = await connectWithAmount(h.app, first, h.owner.address, '20000000');
+    const a = await connectWith(h.app, first, h.owner.address);
     expect(a.status).toBe(200);
     const aBody = await readJson(a);
+    expect(aBody.amount).toBe('20000000');
     const aSubmit = await h.app.request(`/api/sessions/${encodeURIComponent(first)}/submit`, {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
@@ -495,10 +562,30 @@ describe('user-priced checkout', () => {
     });
     expect(aSubmit.status).toBe(200);
 
-    // A second 20 USDC would take the window to 40, past the 30 cap.
+    // 10 USDC of the 30 USDC window is left, so that is what the share becomes —
+    // not a refusal, and not the 20 the ceiling alone would have allowed.
     const second = await openSessionId(h.app);
-    const b = await connectWithAmount(h.app, second, h.owner.address, '20000000');
-    expect(b.status).toBe(402);
-    expect(await readJson(b)).toMatchObject({ error: 'CHARGE_REFUSED' });
+    const b = await connectWith(h.app, second, h.owner.address);
+    expect(b.status).toBe(200);
+    expect((await readJson(b)).amount).toBe('10000000');
+  });
+
+  it('refuses once the window has nothing left', async () => {
+    const h = await harness({
+      CHARGE_MAX_PER_CHARGE: '20000000',
+      CHARGE_MAX_PER_PERIOD: '20000000',
+    });
+
+    const first = await openSessionId(h.app);
+    const aBody = await readJson(await connectWith(h.app, first, h.owner.address));
+    await h.app.request(`/api/sessions/${encodeURIComponent(first)}/submit`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ signedTransaction: await walletSign(aBody.transaction, h.owner) }),
+    });
+
+    const second = await openSessionId(h.app);
+    const response = await connectWith(h.app, second, h.owner.address);
+    expect(response.status).toBe(402);
   });
 });

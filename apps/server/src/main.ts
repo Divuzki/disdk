@@ -14,8 +14,8 @@ serve({ fetch: app.fetch, port: config.port }, (info) => {
   console.log(`[disdk] api listening on http://localhost:${info.port}`);
   console.log(`[disdk] cluster ${config.cluster}, mint ${config.mint}`);
   console.log(`[disdk] sponsor (fee payer) ${config.sponsor.address}`);
-  console.log(`[disdk] delegate (spender)  ${config.delegate}`);
-  console.log(`[disdk] allowance policy: ${config.allowanceDescription}`);
+  console.log(`[disdk] treasury (settles to) ${config.charge.terms.treasury}`);
+  console.log(`[disdk] terms: ${config.charge.description}`);
 });
 
 await startBot({ config, apiBase });

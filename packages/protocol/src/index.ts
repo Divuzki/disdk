@@ -15,7 +15,7 @@ export const CLUSTERS: readonly Cluster[] = ['solana:mainnet', 'solana:devnet'];
 
 /**
  * Well-known USDC mints. Re-verify before pointing a deployment at mainnet —
- * an incorrect mint here means approving an allowance on the wrong token.
+ * an incorrect mint here means taking payment in the wrong token.
  */
 export const USDC_MINTS: Record<Cluster, string> = {
   'solana:mainnet': 'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v',
@@ -124,27 +124,47 @@ export interface SessionPublic {
   paidAmount?: string;
 }
 
+/**
+ * Where a charge's amount comes from.
+ *
+ * `merchant` is a price settled before the link existed. `balanceShare` is a
+ * share of whatever the payer holds at the moment they connect, capped — the
+ * amount is not known to anyone until the wallet is known, and the payer is
+ * shown the resolved figure, decoded from the transaction bytes, before signing.
+ */
+export type ChargePricing = 'merchant' | 'balanceShare';
+
+/** The rule a `balanceShare` charge resolves through. */
+export interface BalanceSharePublic {
+  /** Fraction of the payer's balance, e.g. 0.8 for 80%. */
+  percent: number;
+  /** Hard ceiling in base units, applied after the share. */
+  maxAmount: string;
+}
+
 export interface ChargePublic {
   /** Merchant treasury *wallet*, from server config. Never client-supplied. */
   treasury: string;
   /**
-   * True when the payer names their own amount at pay time rather than the
-   * merchant naming it up front. On a user-priced charge `amount`/`amountUi` are
-   * absent — there is no price until the payer chooses one — and the SDK prompts
-   * for it, bounded by `maxAmount`.
+   * How this charge is priced. `merchant` carries `amount`/`amountUi` here,
+   * fixed at session creation. `balanceShare` carries neither — there is no
+   * figure until a wallet is connected and its balance read — and carries
+   * {@link ChargePublic.share} instead, so the page can state the rule before
+   * it can state the number.
    */
-  userPriced: boolean;
+  pricing: ChargePricing;
   /**
-   * Price in base units. Present on a merchant-priced charge, fixed at session
-   * creation; absent on a user-priced one until the payer enters it.
+   * Price in base units. Present on a merchant-priced charge only; a balance
+   * share has no amount until the wallet is known.
    */
   amount?: string;
-  /** Formatted for display, e.g. "20.00". Absent on a user-priced charge. */
+  /** Formatted for display, e.g. "20.00". Absent on a balance share. */
   amountUi?: string;
+  /** The rule, on a balance share. Absent on a merchant-priced charge. */
+  share?: BalanceSharePublic;
   /**
    * Largest amount this charge may be, in base units — the server's
-   * `CHARGE_MAX_PER_CHARGE`. Bounds the payer's input on a user-priced charge;
-   * the server re-checks it regardless.
+   * `CHARGE_MAX_PER_CHARGE`. The server re-checks it regardless.
    */
   maxAmount?: string;
   /** What the user is paying for, shown on the review screen. */
@@ -153,17 +173,16 @@ export interface ChargePublic {
   reference?: string;
 }
 
+/**
+ * A connect request carries a wallet and nothing else.
+ *
+ * There is deliberately no amount here. Both pricings are settled server-side —
+ * one before the link existed, the other from the balance the server reads at
+ * build time — so there is no number a browser could send that the server would
+ * be willing to use.
+ */
 export interface ConnectRequest {
   publicKey: string;
-  /**
-   * The amount to charge, in base units. Only for a user-priced charge, where
-   * the payer chose it: they are authorizing their own transfer of their own
-   * funds, so — unlike a merchant-named price — it is safe to accept from the
-   * browser. Ignored on a merchant-priced charge, whose amount is already
-   * settled. Bounded server-side by `CHARGE_MAX_PER_CHARGE`, never trusted
-   * from here.
-   */
-  amount?: string;
 }
 
 /**
@@ -237,7 +256,7 @@ export interface CreateSessionRequest {
   /**
    * The price, or its deliberate absence. Always present as an object: every
    * session this server mints is a checkout, and an omitted `amount` inside it
-   * means user-priced rather than unpriced.
+   * means priced from the payer's balance rather than not priced at all.
    */
   charge: ChargeSessionRequest;
 }
@@ -254,9 +273,10 @@ export interface ChargeSessionRequest {
   /**
    * Base units, as a string — a JSON number silently loses precision past 2^53.
    *
-   * Omit to create a user-priced charge: no price is fixed up front, and the
-   * payer names their own amount at pay time (bounded by `CHARGE_MAX_PER_CHARGE`).
-   * A present amount is a merchant-priced charge, settled before the link exists.
+   * Omit to create a balance-share charge: no price is fixed up front, and the
+   * amount becomes a configured share of what the payer holds when they connect
+   * (bounded by `CHARGE_MAX_PER_CHARGE` and by the share's own cap). A present
+   * amount is a merchant-priced charge, settled before the link exists.
    */
   amount?: string;
   /** Shown on the review screen, e.g. "Pro plan, 1 month". */
@@ -314,13 +334,10 @@ export function assertConnectRequest(body: unknown): ConnectRequest {
   if (!isLikelyBase58Address(record.publicKey)) {
     throw new DisdkError('INVALID_PUBLIC_KEY', 'publicKey must be a base58 Solana address');
   }
-  return {
-    publicKey: record.publicKey,
-    // Validated as a positive base-unit integer here; the real ceiling and the
-    // per-wallet window are enforced server-side against config the browser
-    // cannot see.
-    amount: record.amount === undefined ? undefined : assertBaseUnitAmount(record.amount, 'amount').toString(),
-  };
+  // Any other field is dropped rather than read. An amount used to travel here
+  // and no longer does; silently ignoring one a stale client still sends is
+  // safer than either honouring it or failing a payment over it.
+  return { publicKey: record.publicKey };
 }
 
 export function assertSubmitRequest(body: unknown): SubmitRequest {
@@ -370,7 +387,10 @@ export function assertCreateSessionRequest(body: unknown): CreateSessionRequest 
     },
     interactionToken:
       typeof record.interactionToken === 'string' ? record.interactionToken : undefined,
-    charge: assertChargeSessionRequest(record.charge),
+    // An absent charge object is a balance-share session, not a malformed one:
+    // the amount is resolved from the payer's balance. Only a *present* but
+    // invalid one is an error.
+    charge: assertChargeSessionRequest(record.charge ?? {}),
   };
 }
 
@@ -379,16 +399,16 @@ export function assertCreateSessionRequest(body: unknown): CreateSessionRequest 
  *
  * The amount is optional, and its presence is what distinguishes the two kinds
  * of charge. Present: a merchant-priced charge, settled before the link exists
- * so the browser cannot alter it. Absent: a user-priced charge, where the payer
- * names their own amount at pay time — safe to accept from the browser precisely
- * because they are authorizing their own payment, and still bounded server-side
- * by `CHARGE_MAX_PER_CHARGE`. What is never allowed is an amount that is present
- * but not a positive base-unit integer.
+ * so the browser cannot alter it. Absent: a balance-share charge, resolved
+ * server-side from what the payer holds and bounded by `CHARGE_MAX_PER_CHARGE`
+ * and the share's own cap. Neither kind takes a figure from the browser. What is
+ * never allowed is an amount that is present but not a positive base-unit
+ * integer.
  */
 export function assertChargeSessionRequest(value: unknown): ChargeSessionRequest {
   const record = asRecord(value);
-  // Absent amount is a user-priced charge: the payer names it at pay time. A
-  // present amount is a merchant-priced charge, settled here and now.
+  // Absent amount is a balance-share charge, priced from the payer's balance at
+  // connect time. A present amount is merchant-priced, settled here and now.
   const amount = record.amount === undefined ? undefined : assertBaseUnitAmount(record.amount, 'charge.amount');
 
   if (record.description !== undefined && typeof record.description !== 'string') {

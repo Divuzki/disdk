@@ -15,37 +15,6 @@ importers:
         specifier: ^4.1.10
         version: 4.1.10(@types/node@26.2.0)(jsdom@25.0.1)(vite@8.2.1(@types/node@26.2.0)(esbuild@0.27.7)(terser@5.50.0))
 
-  apps/charge:
-    dependencies:
-      '@disdk/protocol':
-        specifier: workspace:*
-        version: link:../../packages/protocol
-      '@disdk/verify':
-        specifier: workspace:*
-        version: link:../../packages/verify
-      '@hono/node-server':
-        specifier: ^1.14.0
-        version: 1.19.17(hono@4.13.2)
-      '@solana/kit':
-        specifier: ^7.1.0
-        version: 7.1.0(typescript@5.9.3)
-      hono:
-        specifier: ^4.13.2
-        version: 4.13.2
-    devDependencies:
-      '@solana-program/token':
-        specifier: ^0.15.0
-        version: 0.15.0(@solana/kit@7.1.0(typescript@5.9.3))
-      '@types/node':
-        specifier: ^26.2.0
-        version: 26.2.0
-      typescript:
-        specifier: ^5.9.3
-        version: 5.9.3
-      vitest:
-        specifier: ^4.1.10
-        version: 4.1.10(@types/node@26.2.0)(jsdom@25.0.1)(vite@8.2.1(@types/node@26.2.0)(esbuild@0.27.7)(terser@5.50.0))
-
   apps/demo:
     devDependencies:
       vite:

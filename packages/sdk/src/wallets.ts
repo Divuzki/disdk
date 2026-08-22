@@ -1,10 +1,15 @@
 /**
  * Wallet discovery via the Wallet Standard.
  *
- * Every current Solana wallet — Phantom, Solflare, Backpack, Coinbase and the
- * rest — announces itself through the Wallet Standard, so there is no per-wallet
- * adapter here. Mobile Wallet Adapter registers through the same mechanism, so
- * Android phones appear in the same list as desktop extensions.
+ * Every current Solana wallet — Phantom, Solflare, Backpack, Coinbase, Trust,
+ * OKX, Exodus, Glow, Atomic and the rest — announces itself through the Wallet
+ * Standard, so there is no per-wallet adapter here. Mobile Wallet Adapter
+ * registers through the same mechanism, so Android phones appear in the same
+ * list as desktop extensions.
+ *
+ * `catalog.ts` names those wallets, but only for the jobs discovery cannot do:
+ * recognising a wallet's own in-app browser, linking into it, and pointing a
+ * bare desktop browser at a download. Nothing on this path consults it.
  */
 
 import { getWallets } from '@wallet-standard/app';

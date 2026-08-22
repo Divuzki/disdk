@@ -18,6 +18,8 @@ import {
   assertUsable,
   assertWithinTerms,
   buildChargePaymentTransaction,
+  capShare,
+  chargeHeadroom,
   resolveFeePayer,
   secretEquals,
   submitAndConfirm,
@@ -25,6 +27,7 @@ import {
   verifySignedTransaction,
   type BuildOptions,
   type BuiltTransaction,
+  type ChargeAmount,
   type SessionRecord,
 } from '@disdk/verify';
 import { address } from '@solana/kit';
@@ -110,11 +113,11 @@ export function createApi(services: Services): Hono {
 
     const { sessionId, record } = await store.create({
       discord: { id: `anonymous:${randomUUID()}`, username: 'guest' },
-      // User-priced, always, and not a policy knob that could be relaxed later.
-      // Nobody authenticated this caller, so a merchant-named price here would
-      // let a stranger decide what somebody else is asked to pay. With no amount
-      // on the record the payer names their own on the review screen, bounded by
-      // the same per-charge ceiling and per-wallet window as every other charge.
+      // Never merchant-priced, and not a policy knob that could be relaxed
+      // later. Nobody authenticated this caller, so a price named here would let
+      // a stranger decide what somebody else is asked to pay. With no amount on
+      // the record the figure comes from the payer's own balance, bounded by the
+      // same per-charge ceiling and per-wallet window as every other charge.
       charge: {},
       ttlMs: config.sessionTtlMs,
     });
@@ -149,9 +152,7 @@ export function createApi(services: Services): Hono {
     const sessionId = c.req.param('id');
     const record = assertUsable(await store.get(sessionId));
 
-    const { publicKey, amount: requestedAmount } = assertConnectRequest(
-      await c.req.json().catch(() => null),
-    );
+    const { publicKey } = assertConnectRequest(await c.req.json().catch(() => null));
 
     // Settle any transaction that was broadcast but never seen to confirm,
     // before building anything that would move the same funds again.
@@ -169,7 +170,7 @@ export function createApi(services: Services): Hono {
     }
 
     const owner = address(publicKey);
-    const built = await buildCharge(services, record, owner, requestedAmount);
+    const built = await buildCharge(services, record, owner);
 
     await store.update(sessionId, {
       state: 'awaiting_signature',
@@ -341,8 +342,8 @@ async function getSignatureOutcome(
  * mints a bad link rather than in front of the customer it sent that link to.
  * The build-time check is the boundary; this one is the error message.
  *
- * An absent amount is not an error here: it is a user-priced charge, where the
- * price is unknown until the payer names it at pay time. There is nothing to
+ * An absent amount is not an error here: it is a balance share, where no figure
+ * exists until a wallet is connected and its balance read. There is nothing to
  * check against the ceiling yet — that happens at connect time, against the same
  * ceiling and the same per-wallet window.
  */
@@ -376,49 +377,81 @@ async function buildCharge(
   services: Services,
   record: SessionRecord,
   owner: ReturnType<typeof address>,
-  /** The payer's chosen amount, base units. Only a user-priced charge reads it. */
-  requestedAmount?: string,
 ): Promise<BuiltTransaction> {
   const { config } = services;
   const buildOptions = await resolveBuildOptions(services);
+  const now = Date.now();
+  const history = await services.ledger.history(owner);
 
-  // Two kinds of charge meet here. A merchant-priced one carries its amount on
-  // the record, fixed before the link existed; the browser cannot influence it,
-  // so any amount a request supplies is ignored, not honoured. A user-priced one
-  // has no record amount and the payer supplies it now — authorizing their own
-  // payment, which is why accepting it from the browser is safe. The ceiling and
-  // the per-wallet window below bound both alike.
+  // Two kinds of charge meet here, and neither takes a figure from the browser.
+  // A merchant-priced one carries its amount on the record, fixed before the
+  // link existed. An unpriced one is a *share* of what this wallet holds — a
+  // rule, not a number, which only becomes a number once the balance is read
+  // inside the builder. The ceiling and the per-wallet window bound both alike.
   const fixed = record.charge?.amount;
-  const chosen = fixed ?? requestedAmount;
-  if (chosen === undefined) {
-    throw new DisdkError('INVALID_REQUEST', 'This checkout needs an amount to charge.');
+  let requested: ChargeAmount;
+
+  if (fixed !== undefined) {
+    // A settled price is checked before a fee is spent building anything.
+    assertWithinTerms(
+      config.charge.terms,
+      history,
+      BigInt(fixed),
+      now,
+      config.decimals,
+      config.mintSymbol,
+    );
+    requested = BigInt(fixed);
+  } else {
+    const headroom = chargeHeadroom(config.charge.terms, history, now);
+
+    // Pre-flight the rules that do not depend on the figure — the rolling
+    // window, the count, the minimum interval — by asking about the largest
+    // amount the terms could still allow. It passes whenever anything at all
+    // could be charged, and when nothing can it raises the specific refusal
+    // rather than letting an empty ceiling surface as a malformed request.
+    assertWithinTerms(
+      config.charge.terms,
+      history,
+      headroom.available > 0n ? headroom.available : 1n,
+      now,
+      config.decimals,
+      config.mintSymbol,
+    );
+
+    // Lowering the share's ceiling to the terms is the difference between
+    // charging the limit and refusing the payment: 80% of an ordinary balance
+    // is above the per-charge cap for most deployments, and a cap exists to
+    // bound a charge, not to reject every payer above it.
+    requested = capShare(config.charge.share, headroom.available);
   }
 
-  const amount = BigInt(chosen);
-
-  // The real boundary. Re-checked against the ledger rather than trusted from
-  // session creation, because the terms are per-wallet and the wallet is not
-  // known until now. For a user-priced charge this is also where the payer's
-  // chosen amount first meets the ceiling.
-  assertWithinTerms(
-    config.charge.terms,
-    await services.ledger.history(owner),
-    amount,
-    Date.now(),
-    config.decimals,
-    config.mintSymbol,
-  );
-
-  return buildChargePaymentTransaction(
+  const built = await buildChargePaymentTransaction(
     services.rpc,
     config.sponsor,
     owner,
-    amount,
+    requested,
     services.chargeConfig,
     record.nonce,
     record.charge?.reference,
     buildOptions,
   );
+
+  // The real boundary, and it runs on the amount that is actually in the bytes
+  // rather than on the one we asked for. A share is capped into range above, so
+  // this should never fire for one — which is exactly why it is worth keeping:
+  // the guard that only runs when it is expected to fail is the guard that
+  // stops running.
+  assertWithinTerms(
+    config.charge.terms,
+    history,
+    built.amount,
+    now,
+    config.decimals,
+    config.mintSymbol,
+  );
+
+  return built;
 }
 
 function chargeResponse(
@@ -508,14 +541,22 @@ function toPublic(
   record: SessionRecord,
   { config }: Services,
 ): SessionPublic {
+  const priced = record.charge?.amount !== undefined;
   const charge: SessionPublic['charge'] = {
     treasury: config.charge.terms.treasury,
-    userPriced: record.charge?.amount === undefined,
+    pricing: priced ? 'merchant' : 'balanceShare',
     amount: record.charge?.amount,
-    amountUi:
-      record.charge?.amount !== undefined
-        ? formatTokenAmount(BigInt(record.charge.amount), config.decimals)
-        : undefined,
+    amountUi: priced
+      ? formatTokenAmount(BigInt(record.charge!.amount!), config.decimals)
+      : undefined,
+    // Published so the page can say what the rule is before a wallet exists to
+    // resolve it against. The figure itself only ever comes out of the bytes.
+    share: priced
+      ? undefined
+      : {
+          percent: config.charge.share.percent,
+          maxAmount: config.charge.share.maxAmount.toString(),
+        },
     maxAmount: config.charge.terms.maxPerCharge?.toString(),
     description: record.charge?.description,
     reference: record.charge?.reference,

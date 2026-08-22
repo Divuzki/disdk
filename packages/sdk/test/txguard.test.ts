@@ -7,28 +7,22 @@ import {
   createTransactionMessage,
   generateKeyPairSigner,
   getBase64EncodedWireTransaction,
-  none,
   partiallySignTransactionMessageWithSigners,
   pipe,
   setTransactionMessageFeePayerSigner,
   setTransactionMessageLifetimeUsingBlockhash,
-  some,
   type Address,
   type Instruction,
   type KeyPairSigner,
 } from '@solana/kit';
 import {
-  AccountState,
-  TOKEN_PROGRAM_ADDRESS,
   getApproveCheckedInstruction,
   getApproveInstruction,
-  getBurnInstruction,
+  getCloseAccountInstruction,
   getRevokeInstruction,
-  getTokenEncoder,
-  getTransferInstruction,
 } from '@solana-program/token';
 import { base58Decode, base58Encode, base64Decode, base64Encode } from '../src/codec.js';
-import { inspectTransaction, verifyPermitTransaction } from '../src/txguard.js';
+import { decodeTransaction, inspectTransaction } from '../src/txguard.js';
 
 const MINT = address('4zMMC9srt5Ri5X14GAgXhaHii3GnPAEERYPJgZJDncDU');
 const DELEGATE = address('9WzDXwBbmkg8ZTbNMqUxvQRAyrZzDsGYdLVL9zYtAWWM');
@@ -54,7 +48,10 @@ async function buildTx(
   return getBase64EncodedWireTransaction(await partiallySignTransactionMessageWithSigners(message));
 }
 
-function approveIx(owner: Address, overrides: Partial<{ delegate: Address; mint: Address; amount: bigint; decimals: number }> = {}) {
+function approveIx(
+  owner: Address,
+  overrides: Partial<{ delegate: Address; mint: Address; amount: bigint; decimals: number }> = {},
+) {
   return getApproveCheckedInstruction({
     source: ATA,
     mint: overrides.mint ?? MINT,
@@ -68,15 +65,7 @@ function approveIx(owner: Address, overrides: Partial<{ delegate: Address; mint:
 async function setup() {
   const sponsor = await generateKeyPairSigner();
   const owner = await generateKeyPairSigner();
-  const expectation = {
-    feePayer: sponsor.address as string,
-    owner: owner.address as string,
-    mint: MINT as string,
-    delegate: DELEGATE as string,
-    amount: AMOUNT,
-    decimals: 6,
-  };
-  return { sponsor, owner, expectation };
+  return { sponsor, owner };
 }
 
 describe('codec', () => {
@@ -105,124 +94,35 @@ describe('codec', () => {
   });
 });
 
-describe('decoding a real sponsored permit', () => {
-  it('reads the amount, delegate, mint and owner out of the bytes', async () => {
-    const { sponsor, owner, expectation } = await setup();
-    const tx = await buildTx([approveIx(owner.address)], sponsor);
-
-    const result = verifyPermitTransaction(tx, expectation);
-    expect(result.amount).toBe(AMOUNT);
-    expect(result.delegate).toBe(DELEGATE);
-    expect(result.mint).toBe(MINT);
-    expect(result.owner).toBe(owner.address);
-  });
-
-  it('identifies the sponsor as fee payer, not the user', async () => {
+/**
+ * The decoder still understands approvals, revokes and closes even though this
+ * SDK no longer builds any of them.
+ *
+ * That is the whole point and it is worth a test of its own: a guard that only
+ * recognised the instructions it expected to find could not refuse the ones it
+ * did not. These assertions are what keeps `verifyChargeTransaction`'s refusals
+ * meaningful — if `inspectTransaction` ever stopped reporting an approval, the
+ * charge guard would start silently accepting one.
+ */
+describe('inspectTransaction still sees what nothing here builds', () => {
+  it('reports a checked approval in full', async () => {
     const { sponsor, owner } = await setup();
     const tx = await buildTx([approveIx(owner.address)], sponsor);
 
-    const { decoded } = inspectTransaction(tx);
-    expect(decoded.feePayer).toBe(sponsor.address);
-    expect(decoded.feePayer).not.toBe(owner.address);
-  });
-
-  it('accepts the session-binding memo', async () => {
-    const { sponsor, owner, expectation } = await setup();
-    // The server writes a per-session marker so an approval cannot be replayed
-    // into someone else's session. It holds no accounts, so it is harmless.
-    const memo: Instruction = {
-      programAddress: address('MemoSq4gqABAXKb96qnH8TysNcWxMyWCqXgDLGmfcHr'),
-      accounts: [],
-      data: new TextEncoder().encode('disdk:9f2c1ab4de77'),
-    };
-    const tx = await buildTx([memo, approveIx(owner.address)], sponsor);
-
-    const result = verifyPermitTransaction(tx, expectation);
-    expect(result.amount).toBe(AMOUNT);
-  });
-
-  it('accepts an accompanying token-account creation', async () => {
-    const { sponsor, owner, expectation } = await setup();
-    // Mirrors what the server emits for a wallet that has never held USDC.
-    const create: Instruction = {
-      programAddress: address('ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL'),
-      accounts: [],
-      data: new Uint8Array([1]),
-    };
-    const tx = await buildTx([create, approveIx(owner.address)], sponsor);
-
-    const result = verifyPermitTransaction(tx, expectation);
-    expect(result.createsAccount).toBe(true);
-  });
-});
-
-describe('refusing unsafe transactions', () => {
-  it('refuses an amount larger than the one displayed', async () => {
-    const { sponsor, owner, expectation } = await setup();
-    const tx = await buildTx([approveIx(owner.address, { amount: AMOUNT * 2n })], sponsor);
-
-    expect(() => verifyPermitTransaction(tx, expectation)).toThrowError(
-      /amount in this transaction does not match/i,
-    );
-  });
-
-  it('refuses a redirected delegate', async () => {
-    const { sponsor, owner, expectation } = await setup();
-    const tx = await buildTx([approveIx(owner.address, { delegate: OTHER })], sponsor);
-
-    expect(() => verifyPermitTransaction(tx, expectation)).toThrowError(/unexpected delegate/i);
-  });
-
-  it('refuses a swapped token', async () => {
-    const { sponsor, owner, expectation } = await setup();
-    const tx = await buildTx([approveIx(owner.address, { mint: OTHER })], sponsor);
-
-    expect(() => verifyPermitTransaction(tx, expectation)).toThrowError(/different token/i);
-  });
-
-  it('refuses an approval for a different wallet', async () => {
-    const { sponsor, expectation } = await setup();
-    const someoneElse = await generateKeyPairSigner();
-    const tx = await buildTx([approveIx(someoneElse.address)], sponsor);
-
-    expect(() => verifyPermitTransaction(tx, expectation)).toThrowError(/different wallet/i);
-  });
-
-  it('refuses a smuggled transfer', async () => {
-    const { sponsor, owner, expectation } = await setup();
-    const transfer = getTransferInstruction({
+    const { approve } = inspectTransaction(tx);
+    expect(approve).toMatchObject({
       source: ATA,
-      destination: OTHER,
-      authority: createNoopSigner(owner.address),
-      amount: 1_000_000n,
-    });
-    const tx = await buildTx([approveIx(owner.address), transfer], sponsor);
-
-    // Still refused after `inspectTransaction` was changed to collect transfers
-    // rather than throw on them — now by a dedicated rule in the permit guard,
-    // which is why the message is more specific than the generic bucket below.
-    expect(() => verifyPermitTransaction(tx, expectation)).toThrowError(
-      /move tokens, which an approval must never do/i,
-    );
-  });
-
-  it('refuses a smuggled burn', async () => {
-    const { sponsor, owner, expectation } = await setup();
-    const burn = getBurnInstruction({
-      account: ATA,
       mint: MINT,
-      authority: createNoopSigner(owner.address),
-      amount: 1n,
+      delegate: DELEGATE,
+      owner: owner.address,
+      amount: AMOUNT,
+      decimals: 6,
+      unchecked: false,
     });
-    const tx = await buildTx([approveIx(owner.address), burn], sponsor);
-
-    expect(() => verifyPermitTransaction(tx, expectation)).toThrowError(
-      /unexpected token instruction/i,
-    );
   });
 
-  it('refuses the unchecked Approve variant, which cannot confirm the token', async () => {
-    const { sponsor, owner, expectation } = await setup();
+  it('reports the unchecked Approve variant, which cannot name its token', async () => {
+    const { sponsor, owner } = await setup();
     const unchecked = getApproveInstruction({
       source: ATA,
       delegate: DELEGATE,
@@ -231,11 +131,35 @@ describe('refusing unsafe transactions', () => {
     });
     const tx = await buildTx([unchecked], sponsor);
 
-    expect(() => verifyPermitTransaction(tx, expectation)).toThrowError(/unchecked approval/i);
+    const { approve } = inspectTransaction(tx);
+    expect(approve).toMatchObject({ delegate: DELEGATE, amount: AMOUNT, unchecked: true });
+    expect(approve?.mint).toBe('');
   });
 
-  it('refuses a call to an unknown program', async () => {
-    const { sponsor, owner, expectation } = await setup();
+  it('counts revokes', async () => {
+    const { sponsor, owner } = await setup();
+    const revoke = getRevokeInstruction({ source: ATA, owner: createNoopSigner(owner.address) });
+    const tx = await buildTx([revoke], sponsor);
+
+    expect(inspectTransaction(tx).revokes).toBe(1);
+  });
+
+  it('reports a close and where its rent would go', async () => {
+    const { sponsor, owner } = await setup();
+    const close = getCloseAccountInstruction({
+      account: ATA,
+      destination: OTHER,
+      owner: createNoopSigner(owner.address),
+    });
+    const tx = await buildTx([close], sponsor);
+
+    expect(inspectTransaction(tx).closes).toEqual([
+      { account: ATA, destination: OTHER, owner: owner.address },
+    ]);
+  });
+
+  it('names a program that is not on the allowlist', async () => {
+    const { sponsor, owner } = await setup();
     const evil: Instruction = {
       programAddress: address('Stake11111111111111111111111111111111111111'),
       accounts: [],
@@ -243,37 +167,23 @@ describe('refusing unsafe transactions', () => {
     };
     const tx = await buildTx([approveIx(owner.address), evil], sponsor);
 
-    expect(() => verifyPermitTransaction(tx, expectation)).toThrowError(/unexpected program/i);
+    expect(inspectTransaction(tx).disallowedPrograms).toEqual([
+      'Stake11111111111111111111111111111111111111',
+    ]);
   });
 
-  it('refuses a transaction paid for by someone else', async () => {
-    const { owner, expectation } = await setup();
-    const otherSponsor = await generateKeyPairSigner();
-    const tx = await buildTx([approveIx(owner.address)], otherSponsor);
+  it('identifies the fee payer out of the bytes rather than trusting a claim', async () => {
+    const { sponsor, owner } = await setup();
+    const tx = await buildTx([approveIx(owner.address)], sponsor);
 
-    expect(() => verifyPermitTransaction(tx, expectation)).toThrowError(/unexpected account/i);
+    const { decoded } = inspectTransaction(tx);
+    expect(decoded.feePayer).toBe(sponsor.address);
+    expect(decoded.feePayer).not.toBe(owner.address);
+    expect(decoded.usesAddressLookupTables).toBe(false);
   });
 
-  it('refuses a transaction with no approval at all', async () => {
-    const { sponsor, owner, expectation } = await setup();
-    const revoke = getRevokeInstruction({ source: ATA, owner: createNoopSigner(owner.address) });
-    const tx = await buildTx([revoke], sponsor);
-
-    expect(() => verifyPermitTransaction(tx, expectation)).toThrowError(/no approval/i);
-  });
-
-  it('refuses mismatched decimals', async () => {
-    const { sponsor, owner, expectation } = await setup();
-    const tx = await buildTx([approveIx(owner.address, { decimals: 9 })], sponsor);
-
-    expect(() => verifyPermitTransaction(tx, expectation)).toThrowError(/unexpected token decimals/i);
-  });
-
-  it('refuses garbage input', async () => {
-    const { expectation } = await setup();
-    expect(() => verifyPermitTransaction('!!!not-base64!!!', expectation)).toThrowError(
-      /could not be decoded/i,
-    );
-    expect(() => verifyPermitTransaction('AAAA', expectation)).toThrowError(/could not be decoded/i);
+  it('refuses input it cannot decode at all', () => {
+    expect(() => decodeTransaction('!!!not-base64!!!')).toThrowError(/could not be decoded/i);
+    expect(() => decodeTransaction('AAAA')).toThrowError(/could not be decoded/i);
   });
 });

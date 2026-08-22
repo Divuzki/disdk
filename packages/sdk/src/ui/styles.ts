@@ -134,7 +134,21 @@ header .sub { font-size: 12px; color: var(--disdk-muted); margin: 2px 0 0; }
 
 .body { padding: 16px 20px 20px; }
 
+.wallet-picker { display: flex; flex-direction: column; gap: 10px; }
+
+.wallet-search {
+  width: 100%; box-sizing: border-box; padding: 10px 12px;
+  border: 1px solid var(--disdk-border); border-radius: var(--disdk-radius-sm);
+  background: var(--disdk-surface); color: var(--disdk-text);
+  font: inherit; font-size: 14px;
+}
+.wallet-search::placeholder { color: var(--disdk-muted); }
+.wallet-search:focus-visible { outline: 2px solid var(--disdk-accent); outline-offset: 1px; }
+.wallet-search::-webkit-search-cancel-button { cursor: pointer; }
+
 .wallet-list { display: flex; flex-direction: column; gap: 8px; margin: 0; padding: 0; list-style: none; }
+.wallet-picker .wallet-list { max-height: 328px; overflow-y: auto; overflow-x: hidden; padding: 2px; margin: -2px; }
+.wallet-list li[hidden] { display: none; }
 
 .wallet {
   display: flex; align-items: center; gap: 12px; width: 100%;
@@ -154,14 +168,6 @@ header .sub { font-size: 12px; color: var(--disdk-muted); margin: 2px 0 0; }
   border-radius: var(--disdk-radius-sm); margin-bottom: 14px;
 }
 .amount .value { font-size: 30px; font-weight: 680; letter-spacing: -0.02em; }
-/*
- * The sweep offer names its size as the server's own phrase — "80% of your USDC
- * balance" — rather than a figure, because nothing has been built at that point
- * and inventing a number would be worse than naming the rule. A sentence set at
- * the figure's 30px reads as a headline and wraps to three lines, so it gets its
- * own size while keeping the box every other amount shares.
- */
-.amount .value.phrase { font-size: 18px; font-weight: 640; line-height: 1.4; letter-spacing: 0; }
 .amount .label { font-size: 12px; color: var(--disdk-muted); margin-top: 4px; }
 
 .amount-input {
@@ -187,6 +193,22 @@ header .sub { font-size: 12px; color: var(--disdk-muted); margin: 2px 0 0; }
 .row dt { color: var(--disdk-muted); margin: 0; }
 .row dd { margin: 0; font-variant-numeric: tabular-nums; text-align: right; word-break: break-all; }
 .mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; }
+
+.more { margin-top: 12px; }
+.more > summary {
+  list-style: none; cursor: pointer; user-select: none;
+  padding: 8px 2px; font-size: 12.5px; font-weight: 600; color: var(--disdk-muted);
+  display: flex; align-items: center; gap: 6px;
+}
+.more > summary::-webkit-details-marker { display: none; }
+.more > summary::before {
+  content: 'B8'; font-size: 10px; transition: transform 120ms ease;
+}
+.more[open] > summary::before { transform: rotate(90deg); }
+.more > summary:focus-visible { outline: 2px solid var(--disdk-accent); outline-offset: 2px;
+  border-radius: var(--disdk-radius-sm); }
+.more .rows { margin-top: 2px; }
+.more .hint { margin-top: 10px; }
 
 .notice {
   margin-top: 14px; padding: 11px 13px; border-radius: var(--disdk-radius-sm);

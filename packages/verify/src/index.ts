@@ -14,6 +14,16 @@ export {
 } from './build.js';
 export type { BuildOptions, BuiltTransaction, ChargeSessionConfig } from './build.js';
 
+export {
+  resolveChargeAmount,
+  capShare,
+  isBalanceShare,
+  parseBalanceShare,
+  DEFAULT_SHARE_PERCENT,
+  DEFAULT_SHARE_MAX_AMOUNT,
+} from './amount.js';
+export type { BalanceShare, ChargeAmount } from './amount.js';
+
 export { verifySignedTransaction, verifyOnChainTransaction, bytesEqual } from './verifyTx.js';
 export type { VerifiedTransaction } from './verifyTx.js';
 

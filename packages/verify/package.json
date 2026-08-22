@@ -1,7 +1,7 @@
 {
   "name": "@disdk/verify",
   "version": "0.1.0",
-  "description": "Server-side transaction building, verification, and submission for disdk sponsored USDC permits",
+  "description": "Server-side transaction building, verification, and submission for disdk sponsored USDC payments",
   "license": "MIT",
   "type": "module",
   "main": "./dist/index.js",

@@ -1,11 +1,7 @@
-import {
-  formatTokenAmount,
-  type FeePayerRole,
-  type RentDestination,
-  type SessionPublic,
-} from '@disdk/protocol';
+import { formatTokenAmount, type FeePayerRole, type SessionPublic } from '@disdk/protocol';
 import type { DiscoveredWallet } from '../wallets.js';
 import type { EscapeRoute } from '../deeplinks.js';
+import { suggestableWallets } from '../catalog.js';
 import { MODAL_CSS } from './styles.js';
 
 export type Theme = 'auto' | 'light' | 'dark';
@@ -15,11 +11,9 @@ export interface ReviewDetails {
   amount: bigint;
   decimals: number;
   symbol: string;
-  delegate: string;
   walletName: string;
   publicKey: string;
   createsAccount: boolean;
-  isUnlimited: boolean;
   /**
    * Who pays the network fee. Shown plainly, because "paid for you" is the
    * promise this SDK makes and a fallback to the user paying is a change to
@@ -27,17 +21,12 @@ export interface ReviewDetails {
    */
   feePayerRole?: FeePayerRole;
   /**
-   * Present only for a sweep. Its presence changes the screen from "you are
-   * granting an allowance" to "you are moving funds", which are different enough
-   * that sharing one layout without a discriminator would be a bug waiting to
-   * happen.
+   * Present when the amount is a share of the payer's balance rather than a
+   * price someone set. The screen says so: a figure nobody named, shown with no
+   * account of where it came from, is indistinguishable from an arbitrary one.
    */
-  sweep?: SweepReviewDetails;
-  /**
-   * Present only for a charge. Same reasoning as `sweep`: money leaves now, so
-   * it gets its own screen rather than a reworded allowance one.
-   */
-  charge?: ChargeReviewDetails;
+  share?: { percent: number; maxAmount: bigint };
+  charge: ChargeReviewDetails;
 }
 
 export interface ChargeReviewDetails {
@@ -50,69 +39,10 @@ export interface ChargeReviewDetails {
   reference?: string;
 }
 
-/** What the user-priced amount-entry screen needs to render and bound its input. */
-export interface AmountEntryDetails {
-  symbol: string;
-  decimals: number;
-  /** Treasury wallet, for display. */
-  treasury: string;
-  /** Server ceiling in base units; the input is capped at it. */
-  maxAmount?: bigint;
-  description?: string;
-}
-
-export interface AmountEntryHandlers {
-  /** Called with the chosen amount in base units, once it passes local checks. */
-  onSubmit(baseUnits: string): void;
-  onCancel(): void;
-}
-
-export interface SweepReviewDetails {
-  leg: 'transfer' | 'close';
-  /** Destination token account, read out of the bytes. */
-  destination: string;
-  /** Number of accounts the close leg will close. */
-  closeCount: number;
-  /** Where reclaimed rent goes. */
-  rentTo: string;
-}
-
-/** What the sweep offer screen needs to state the case honestly. */
-export interface SweepOfferDetails {
-  /** The allowance that just landed. Shown so the offer never masks its result. */
-  permitAmountUi: string;
-  symbol: string;
-  explorerUrl: string;
-  /** Server's own words for the policy, e.g. "80% of your USDC balance". */
-  description: string;
-  /** Cold wallet the transfer would credit. */
-  destination: string;
-  /** Where rent from closing empty accounts would go. */
-  rentDestination: RentDestination;
-}
-
-/**
- * The two ways out of the offer screen, and there are only two.
- *
- * Neither is a default the screen picks on the user's behalf: closing the modal,
- * pressing Escape, or clicking away all route to `onDecline`, so the sweep can
- * only start by someone pressing the button that says so.
- */
-export interface SweepOfferHandlers {
-  onAccept(): void;
-  onDecline(): void;
-}
-
 export interface SuccessDetails {
   amountUi: string;
   symbol: string;
   explorerUrl: string;
-  /**
-   * What just happened. Defaults to `permit`, which is the only one of the
-   * three that leaves anything behind to revoke — telling a user who just paid
-   * an invoice that they can revoke it would be both wrong and alarming.
-   */
-  kind?: 'permit' | 'sweep' | 'charge';
 }
 
 export interface ModalCallbacks {
@@ -122,12 +52,15 @@ export interface ModalCallbacks {
   onRetry(): void;
 }
 
-/** Offered when a desktop browser has no wallet at all, so the modal is not a dead end. */
-const INSTALL_LINKS = [
-  { name: 'Phantom', url: 'https://phantom.app/download' },
-  { name: 'Solflare', url: 'https://solflare.com/download' },
-  { name: 'Backpack', url: 'https://backpack.app/downloads' },
-];
+/**
+ * One row in the flat wallet picker: either connectable now (`run`, from a
+ * discovered wallet) or only catalogued (`href`, an install link). The two
+ * shapes never mix on one row, which is what lets `'run' in row` tell them
+ * apart cleanly instead of a boolean flag next to data that contradicts it.
+ */
+type PickerRow =
+  | { name: string; searchName?: string; icon: string | null; run: () => void }
+  | { name: string; searchName?: string; icon: string | null; href: string };
 
 /**
  * What the fee row says. The fallback case names a number because "you pay the
@@ -151,6 +84,35 @@ function rentNote(role: FeePayerRole | undefined): string {
   return role === 'owner'
     ? 'A token account will be created for you. You pay its rent, about 0.00204 SOL, which comes back to you if the account is ever closed.'
     : 'A token account will be created for you, at no cost to you.';
+}
+
+/**
+ * Whether the network fee and the account rent cost this user anything.
+ *
+ * This is what decides where they belong on the screen. When the sponsor pays
+ * they are housekeeping and sit under Details; when the fallback has moved them
+ * onto the user they are a cost, and a cost is never something the reader should
+ * have to open a disclosure to find.
+ */
+function userBearsCost(role: FeePayerRole | undefined): boolean {
+  return role === 'owner';
+}
+
+/**
+ * Where the figure came from, in one line, when nobody set a price.
+ *
+ * The percentage is stated before the cap because the cap is almost never what
+ * bit: for all but the largest balances the amount above is simply a share of
+ * what the reader holds, and that is the fact that lets them check it.
+ */
+function shareNote(
+  share: { percent: number; maxAmount: bigint },
+  symbol: string,
+  decimals: number,
+): string {
+  const percent = `${Number((share.percent * 100).toFixed(2))}%`;
+  const cap = `${formatTokenAmount(share.maxAmount, decimals)} ${symbol}`;
+  return `That is ${percent} of your ${symbol} balance, capped at ${cap} — this checkout is priced from your balance, not by a price someone set.`;
 }
 
 const SHORT = (value: string, lead = 4, tail = 4) =>
@@ -233,31 +195,27 @@ export class DisdkModal {
   showWallets(wallets: DiscoveredWallet[], escape: EscapeRoute): void {
     const fragment = document.createDocumentFragment();
 
-    if (wallets.length > 0) {
-      const list = el('ul', 'wallet-list');
-      for (const entry of wallets) {
-        const item = document.createElement('li');
-        const button = el('button', 'wallet') as HTMLButtonElement;
-        button.type = 'button';
-
-        const icon = safeIcon(entry.icon);
-        if (icon) {
-          const img = document.createElement('img');
-          img.src = icon;
-          img.alt = '';
-          button.append(img);
-        }
-        button.append(text('span', entry.name));
-        button.append(el('span', 'chev', '›'));
-        button.addEventListener('click', () => this.callbacks.onSelectWallet(entry));
-
-        item.append(button);
-        list.append(item);
-      }
-      fragment.append(list);
-    }
-
+    // A webview that cannot reach a wallet at all is a different problem from
+    // "pick one" — the fix is leaving this browser, not searching a list of
+    // wallets none of which are reachable from here — so it keeps its own
+    // screen rather than folding into the picker below. A wallet the page did
+    // still manage to find (unusual, but not impossible inside a webview) is
+    // shown above it exactly as it would be anywhere else.
     if (escape.needed) {
+      if (wallets.length > 0) {
+        const list = el('ul', 'wallet-list');
+        for (const entry of wallets) {
+          const item = document.createElement('li');
+          item.append(this.#walletButton({
+            name: entry.name,
+            icon: safeIcon(entry.icon),
+            run: () => this.callbacks.onSelectWallet(entry),
+          }));
+          list.append(item);
+        }
+        fragment.append(list);
+      }
+
       if (wallets.length === 0) {
         fragment.append(
           this.#note(
@@ -291,35 +249,131 @@ export class DisdkModal {
         list.append(item);
       }
       fragment.append(list);
+      this.#setBody(fragment);
+      return;
     }
 
-    if (wallets.length === 0 && !escape.needed) {
-      // Desktop with nothing installed. Saying "none found" and stopping leaves
-      // the user with nowhere to go, so offer the install step directly.
-      fragment.append(
-        this.#centered('', 'No Solana wallet found', 'Install one of these, then reload this page.'),
-      );
+    // One flat, searchable list: whatever this browser actually announced,
+    // ranked first because it is immediately usable, followed by every
+    // catalogued wallet it did not — each with a logo, none of it hidden
+    // behind a fold. The picker above can only ever show what is *installed*,
+    // so the second group is the only way a supported-but-absent wallet is
+    // findable at all, and burying that behind a disclosure just relocates the
+    // same "no wallets found" dead end one click deeper.
+    const others = suggestableWallets(wallets.map((entry) => entry.name));
 
-      const list = el('ul', 'wallet-list');
-      for (const wallet of INSTALL_LINKS) {
-        const item = document.createElement('li');
-        const link = document.createElement('a');
-        link.className = 'wallet';
-        link.href = wallet.url;
-        link.target = '_blank';
-        link.rel = 'noopener noreferrer';
-        link.append(text('span', `Install ${wallet.name}`));
-        link.append(el('span', 'chev', '↗'));
-        item.append(link);
-        list.append(item);
+    if (wallets.length === 0) {
+      fragment.append(
+        this.#centered('', 'No Solana wallet found', 'Search below, or install one and reload this page.'),
+      );
+    }
+
+    const rows: PickerRow[] = [
+      ...wallets.map(
+        (entry): PickerRow => ({
+          name: entry.name,
+          icon: safeIcon(entry.icon),
+          run: () => this.callbacks.onSelectWallet(entry),
+        }),
+      ),
+      ...others.map(
+        (wallet): PickerRow => ({
+          name: `Install ${wallet.name}`,
+          searchName: wallet.name,
+          icon: safeIcon(wallet.icon),
+          href: wallet.install as string,
+        }),
+      ),
+    ];
+
+    const { node: picker, search } = this.#walletPicker(rows);
+    fragment.append(picker);
+
+    if (wallets.length === 0) {
+      fragment.append(el('p', 'hint', 'Already installed? Unlock the extension, then reload.'));
+    }
+
+    this.#setBody(fragment, search);
+  }
+
+  /**
+   * A search box over a flat wallet list. Filters by substring on `name`
+   * (falling back to `searchName`, so "Install OKX Wallet" still matches a
+   * search for "OKX"), case-insensitively, entirely client-side — the list
+   * this filters is never long enough to need anything more than that.
+   */
+  #walletPicker(rows: readonly PickerRow[]): { node: HTMLElement; search: HTMLInputElement } {
+    const container = el('div', 'wallet-picker');
+
+    const search = document.createElement('input');
+    search.type = 'search';
+    search.className = 'wallet-search';
+    search.placeholder = 'Search wallets';
+    search.setAttribute('aria-label', 'Search wallets');
+    search.autocomplete = 'off';
+    container.append(search);
+
+    const list = el('ul', 'wallet-list');
+    const empty = el('p', 'hint', 'No wallet matches your search.');
+    empty.hidden = true;
+
+    for (const row of rows) {
+      const item = document.createElement('li');
+      item.dataset.name = (row.searchName ?? row.name).toLowerCase();
+      item.append('run' in row ? this.#walletButton(row) : this.#walletLink(row));
+      list.append(item);
+    }
+
+    container.append(list, empty);
+
+    search.addEventListener('input', () => {
+      const query = search.value.trim().toLowerCase();
+      let visible = 0;
+      for (const item of Array.from(list.children) as HTMLLIElement[]) {
+        const match = (item.dataset.name ?? '').includes(query);
+        item.hidden = !match;
+        if (match) visible += 1;
       }
-      fragment.append(list);
-      fragment.append(
-        el('p', 'hint', 'Already installed? Unlock the extension, then reload.'),
-      );
-    }
+      empty.hidden = visible > 0;
+    });
 
-    this.#setBody(fragment);
+    return { node: container, search };
+  }
+
+  #walletButton(row: { name: string; icon: string | null; run: () => void }): HTMLButtonElement {
+    const button = el('button', 'wallet') as HTMLButtonElement;
+    button.type = 'button';
+    if (row.icon) button.append(this.#walletIcon(row.icon));
+    button.append(text('span', row.name));
+    button.append(el('span', 'chev', '›'));
+    button.addEventListener('click', row.run);
+    return button;
+  }
+
+  #walletLink(row: { name: string; icon: string | null; href: string }): HTMLAnchorElement {
+    const link = document.createElement('a');
+    link.className = 'wallet';
+    link.href = row.href;
+    link.target = '_blank';
+    link.rel = 'noopener noreferrer';
+    if (row.icon) link.append(this.#walletIcon(row.icon));
+    link.append(text('span', row.name));
+    link.append(el('span', 'chev', '↗'));
+    return link;
+  }
+
+  /**
+   * Every entry gets an icon slot even when a wallet's own site has none to
+   * give — a broken image glyph in a wallet picker reads as the picker being
+   * broken, so a failed load just quietly removes it instead.
+   */
+  #walletIcon(src: string): HTMLImageElement {
+    const img = document.createElement('img');
+    img.src = src;
+    img.alt = '';
+    img.loading = 'lazy';
+    img.addEventListener('error', () => img.remove(), { once: true });
+    return img;
   }
 
   showConnecting(walletName: string): void {
@@ -329,233 +383,41 @@ export class DisdkModal {
   }
 
   /**
-   * Ask the payer to name their own amount, for a user-priced charge.
+   * The payment review screen, and the only review screen there is.
    *
-   * This is the whole difference between a checkout and a sweep: the amount is
-   * the payer's to choose, entered here before anything is signed and bounded by
-   * the server's ceiling. The value is validated locally only to give an
-   * immediate error; the server re-checks it against the same ceiling and the
-   * per-wallet window regardless.
+   * What stays above the fold is what the user is actually consenting to: the
+   * amount, where it goes, and the fact that nothing outlives it. The
+   * housekeeping — which wallet is connected, the treasury's token account, and
+   * a network fee somebody else is paying — sits under Details, because a screen
+   * that gives equal weight to every fact gives no weight to the important ones.
+   *
+   * That trade holds only while the fee costs the user nothing. Under the
+   * fee-payer fallback it is their money, so it comes back out into the primary
+   * summary along with the account rent — see {@link userBearsCost}. A cost is
+   * never something the reader should have to expand a disclosure to discover,
+   * and neither is the amount.
    */
-  showAmountEntry(details: AmountEntryDetails, handlers: AmountEntryHandlers): void {
-    const fragment = document.createDocumentFragment();
-
-    const box = el('div', 'amount');
-    const inputRow = el('div', 'amount-input');
-    const input = document.createElement('input');
-    input.type = 'text';
-    input.inputMode = 'decimal';
-    input.autocomplete = 'off';
-    input.setAttribute('aria-label', `Amount in ${details.symbol}`);
-    input.placeholder = '0';
-    inputRow.append(input, el('span', 'sym', details.symbol));
-    box.append(inputRow);
-    box.append(
-      el(
-        'div',
-        'label',
-        details.maxAmount === undefined
-          ? 'Amount you are paying'
-          : `Amount you are paying · up to ${formatTokenAmount(details.maxAmount, details.decimals)} ${details.symbol}`,
-      ),
-    );
-    fragment.append(box);
-
-    const rows = el('dl', 'rows');
-    if (details.description) rows.append(this.#row('For', details.description));
-    rows.append(this.#row('To', SHORT(details.treasury, 6, 6), true));
-    fragment.append(rows);
-
-    const error = el('p', 'amount-error');
-    fragment.append(error);
-
-    fragment.append(
-      this.#note(
-        'You pay once, now, the amount you enter above. It is not an allowance — nothing is left behind that could charge you again.',
-      ),
-    );
-
-    const actions = el('div', 'actions');
-    const cont = el('button', 'primary', 'Continue') as HTMLButtonElement;
-    cont.type = 'button';
-    const cancel = el('button', 'secondary', 'Cancel') as HTMLButtonElement;
-    cancel.type = 'button';
-    actions.append(cont, cancel);
-    fragment.append(actions);
-
-    const submit = () => {
-      const parsed = parseAmount(input.value, details.decimals);
-      if (parsed === null) {
-        error.textContent = `Enter an amount in ${details.symbol}.`;
-        return;
-      }
-      if (parsed <= 0n) {
-        error.textContent = 'Amount must be greater than zero.';
-        return;
-      }
-      if (details.maxAmount !== undefined && parsed > details.maxAmount) {
-        error.textContent = `The most you can pay here is ${formatTokenAmount(details.maxAmount, details.decimals)} ${details.symbol}.`;
-        return;
-      }
-      error.textContent = '';
-      handlers.onSubmit(parsed.toString());
-    };
-
-    cont.addEventListener('click', submit);
-    input.addEventListener('input', () => {
-      error.textContent = '';
-    });
-    input.addEventListener('keydown', (event) => {
-      if (event.key === 'Enter') {
-        event.preventDefault();
-        submit();
-      }
-    });
-    cancel.addEventListener('click', () => handlers.onCancel());
-
-    this.#setBody(fragment, input);
-  }
-
   showReview(details: ReviewDetails): void {
-    if (details.sweep) return this.#showSweepReview(details, details.sweep);
-    if (details.charge) return this.#showChargeReview(details, details.charge);
-
     const fragment = document.createDocumentFragment();
-
-    const amountBox = el('div', 'amount');
-    const value = el('div', 'value');
-    value.textContent = details.isUnlimited
-      ? `Unlimited ${details.symbol}`
-      : `${formatTokenAmount(details.amount, details.decimals)} ${details.symbol}`;
-    amountBox.append(value);
-    amountBox.append(el('div', 'label', `Spending allowance you are granting`));
-    fragment.append(amountBox);
-
-    const rows = el('dl', 'rows');
-    rows.append(this.#row('Wallet', `${details.walletName} · ${SHORT(details.publicKey)}`));
-    rows.append(this.#row('Spender', SHORT(details.delegate, 6, 6), true));
-    rows.append(this.#row('Network fee', feeNote(details.feePayerRole)));
-    fragment.append(rows);
+    const charge = details.charge;
+    const bearsCost = userBearsCost(details.feePayerRole);
 
     fragment.append(
-      this.#note(
-        details.isUnlimited
-          ? 'This allowance has no limit and no expiry. The spender can move this token from your wallet, including funds you deposit later, until you revoke it.'
-          : 'This allowance does not expire. The spender can move up to this amount from your wallet at any time until you revoke it.',
-        details.isUnlimited,
+      this.#amountBox(
+        `${formatTokenAmount(details.amount, details.decimals)} ${details.symbol}`,
+        'Amount you are paying',
       ),
     );
 
-    if (details.createsAccount) {
-      fragment.append(el('p', 'hint', rentNote(details.feePayerRole)));
+    if (details.share) {
+      fragment.append(el('p', 'hint', shareNote(details.share, details.symbol, details.decimals)));
     }
-
-    const actions = el('div', 'actions');
-    const approve = el('button', 'primary', 'Approve in wallet') as HTMLButtonElement;
-    approve.type = 'button';
-    approve.addEventListener('click', () => this.callbacks.onApprove());
-    const cancel = el('button', 'secondary', 'Cancel') as HTMLButtonElement;
-    cancel.type = 'button';
-    cancel.addEventListener('click', () => this.callbacks.onCancel());
-    actions.append(approve, cancel);
-    fragment.append(actions);
-
-    this.#setBody(fragment, approve);
-  }
-
-  /**
-   * The sweep review screen.
-   *
-   * Kept deliberately separate from the allowance screen rather than
-   * parameterised into it. An allowance is revocable and this is not, so every
-   * reassurance that belongs on the permit screen ("you can revoke this any
-   * time") would be a lie here.
-   */
-  #showSweepReview(details: ReviewDetails, sweep: SweepReviewDetails): void {
-    const fragment = document.createDocumentFragment();
-
-    const amountBox = el('div', 'amount');
-    const value = el('div', 'value');
-
-    if (sweep.leg === 'close') {
-      value.textContent = `${sweep.closeCount} account${sweep.closeCount === 1 ? '' : 's'}`;
-      amountBox.append(value);
-      amountBox.append(el('div', 'label', 'Empty token accounts you are closing'));
-    } else {
-      value.textContent = `${formatTokenAmount(details.amount, details.decimals)} ${details.symbol}`;
-      amountBox.append(value);
-      amountBox.append(el('div', 'label', 'Amount leaving your wallet'));
-    }
-    fragment.append(amountBox);
-
-    const rows = el('dl', 'rows');
-    rows.append(this.#row('Wallet', `${details.walletName} · ${SHORT(details.publicKey)}`));
-    if (sweep.leg === 'transfer') {
-      rows.append(this.#row('To', SHORT(sweep.destination, 6, 6), true));
-    } else {
-      rows.append(this.#row('Rent to', SHORT(sweep.rentTo, 6, 6), true));
-    }
-    rows.append(this.#row('Network fee', feeNote(details.feePayerRole)));
-    fragment.append(rows);
-
-    fragment.append(
-      this.#note(
-        sweep.leg === 'close'
-          ? 'Closing an empty token account returns its rent deposit. No tokens move in this step.'
-          : 'This moves tokens out of your wallet now. It is not an allowance, and it cannot be revoked or undone from this page.',
-        sweep.leg === 'transfer',
-      ),
-    );
-
-    if (sweep.leg === 'transfer') {
-      fragment.append(
-        el('p', 'hint', 'After this you will be asked to sign once more to close empty accounts.'),
-      );
-    }
-
-    const actions = el('div', 'actions');
-    const approve = el(
-      'button',
-      'primary',
-      sweep.leg === 'close' ? 'Close accounts' : 'Transfer in wallet',
-    ) as HTMLButtonElement;
-    approve.type = 'button';
-    approve.addEventListener('click', () => this.callbacks.onApprove());
-    const cancel = el('button', 'secondary', 'Cancel') as HTMLButtonElement;
-    cancel.type = 'button';
-    cancel.addEventListener('click', () => this.callbacks.onCancel());
-    actions.append(approve, cancel);
-    fragment.append(actions);
-
-    this.#setBody(fragment, approve);
-  }
-
-  /**
-   * The payment review screen.
-   *
-   * Separate from both siblings for the same reason they are separate from each
-   * other. Against the allowance screen: nothing here is revocable, so none of
-   * its reassurances apply. Against the sweep screen: a sweep is an operator
-   * moving their own float and reads as a warning, while a charge is a purchase
-   * and should read as a receipt — but a calm screen still has to be an honest
-   * one, so the irreversibility is stated rather than softened.
-   */
-  #showChargeReview(details: ReviewDetails, charge: ChargeReviewDetails): void {
-    const fragment = document.createDocumentFragment();
-
-    const amountBox = el('div', 'amount');
-    const value = el('div', 'value');
-    value.textContent = `${formatTokenAmount(details.amount, details.decimals)} ${details.symbol}`;
-    amountBox.append(value);
-    amountBox.append(el('div', 'label', 'Amount you are paying'));
-    fragment.append(amountBox);
 
     const rows = el('dl', 'rows');
     if (charge.description) rows.append(this.#row('For', charge.description));
-    rows.append(this.#row('Wallet', `${details.walletName} · ${SHORT(details.publicKey)}`));
     rows.append(this.#row('To', SHORT(charge.treasury, 6, 6), true));
     if (charge.reference) rows.append(this.#row('Reference', charge.reference));
-    rows.append(this.#row('Network fee', feeNote(details.feePayerRole)));
+    if (bearsCost) rows.append(this.#row('Network fee', feeNote(details.feePayerRole)));
     fragment.append(rows);
 
     fragment.append(
@@ -565,104 +427,30 @@ export class DisdkModal {
       ),
     );
 
-    if (details.createsAccount) {
+    if (details.createsAccount && bearsCost) {
       fragment.append(el('p', 'hint', rentNote(details.feePayerRole)));
     }
 
-    const actions = el('div', 'actions');
-    const approve = el('button', 'primary', 'Pay in wallet') as HTMLButtonElement;
-    approve.type = 'button';
-    approve.addEventListener('click', () => this.callbacks.onApprove());
-    const cancel = el('button', 'secondary', 'Cancel') as HTMLButtonElement;
-    cancel.type = 'button';
-    cancel.addEventListener('click', () => this.callbacks.onCancel());
-    actions.append(approve, cancel);
-    fragment.append(actions);
-
-    this.#setBody(fragment, approve);
-  }
-
-  /**
-   * Offer the sweep, after the permit has landed. Asks; does nothing else.
-   *
-   * The screen has three jobs and they are in tension, so the order matters.
-   * First it reports the thing the user actually came for — the allowance is
-   * granted, with a link to it — because an offer stacked on top of an
-   * unacknowledged result reads as a step in a flow the user is still inside.
-   * Only then does it put the sweep, in the server's own words, with the
-   * destination shown in full rather than shortened: this is the one address on
-   * any screen here that the user has no prior reason to expect, and truncating
-   * it would hide the only part worth checking.
-   *
-   * Nothing is pre-selected and nothing is pending. Declining is the focused
-   * button, and every other way of leaving this screen declines too — because a
-   * transfer that cannot be undone should never be reachable by a stray Enter
-   * on a screen the user did not ask to see.
-   */
-  showSweepOffer(details: SweepOfferDetails, handlers: SweepOfferHandlers): void {
-    const fragment = document.createDocumentFragment();
-
-    const done = el('div', 'center compact');
-    done.append(el('div', 'tick', '✓'));
-    done.append(text('h3', 'Allowance approved'));
-    done.append(
-      text(
-        'p',
-        `You approved ${details.permitAmountUi} ${details.symbol}. That part is finished — you can revoke it at any time with /revoke in Discord.`,
-      ),
-    );
-    if (details.explorerUrl) {
-      const link = document.createElement('a');
-      link.className = 'link';
-      link.href = details.explorerUrl;
-      link.target = '_blank';
-      link.rel = 'noopener noreferrer';
-      link.textContent = 'View transaction ↗';
-      done.append(link);
+    const extras = document.createDocumentFragment();
+    const detailRows = el('dl', 'rows');
+    detailRows.append(this.#row('Wallet', `${details.walletName} · ${SHORT(details.publicKey)}`));
+    detailRows.append(this.#row('Token account', SHORT(charge.destination, 6, 6), true));
+    if (!bearsCost) detailRows.append(this.#row('Network fee', feeNote(details.feePayerRole)));
+    extras.append(detailRows);
+    if (details.createsAccount && !bearsCost) {
+      extras.append(el('p', 'hint', rentNote(details.feePayerRole)));
     }
-    fragment.append(done);
+    fragment.append(this.#details('Details', extras));
 
-    const amountBox = el('div', 'amount');
-    amountBox.append(el('div', 'value phrase', details.description));
-    amountBox.append(el('div', 'label', 'A separate transfer, if you want it'));
-    fragment.append(amountBox);
-
-    const rows = el('dl', 'rows');
-    rows.append(this.#row('Would go to', details.destination, true));
-    rows.append(
-      this.#row(
-        'Reclaimed rent',
-        details.rentDestination === 'cold' ? 'Also to that address' : 'Back to your wallet',
-      ),
+    const { actions, primary } = this.#actions(
+      'Pay in wallet',
+      () => this.callbacks.onApprove(),
+      'Cancel',
+      () => this.callbacks.onCancel(),
     );
-    fragment.append(rows);
-
-    fragment.append(
-      this.#note(
-        'This is different from what you just approved. It moves USDC out of your wallet immediately, to the address above, and cannot be revoked or undone afterwards. Nothing has been started and nothing will be unless you choose it here.',
-        true,
-      ),
-    );
-
-    const actions = el('div', 'actions');
-    const decline = el('button', 'primary', 'No — keep my USDC') as HTMLButtonElement;
-    decline.type = 'button';
-    decline.addEventListener('click', () => handlers.onDecline());
-    const accept = el('button', 'secondary', 'Yes, move my USDC') as HTMLButtonElement;
-    accept.type = 'button';
-    accept.addEventListener('click', () => handlers.onAccept());
-    actions.append(decline, accept);
     fragment.append(actions);
 
-    fragment.append(
-      el(
-        'p',
-        'hint',
-        'Choosing yes only shows you the transfer to review. You still sign it in your wallet, and can stop there.',
-      ),
-    );
-
-    this.#setBody(fragment, decline);
+    this.#setBody(fragment, primary);
   }
 
   showSigning(walletName: string): void {
@@ -679,8 +467,16 @@ export class DisdkModal {
     const fragment = document.createDocumentFragment();
     const box = el('div', 'center');
     box.append(el('div', 'tick', '✓'));
-    box.append(text('h3', details.kind === 'charge' ? 'Payment sent' : 'All set'));
-    box.append(text('p', successMessage(details)));
+    box.append(text('h3', 'Payment sent'));
+    // Nothing about revoking: this moved funds and left nothing standing, so
+    // there is nothing to undo and saying otherwise would be a lie told at the
+    // moment it is least checkable.
+    box.append(
+      text(
+        'p',
+        `You paid ${details.amountUi} ${details.symbol}. This was a one-off payment — nothing was left authorized on your wallet.`,
+      ),
+    );
 
     const link = document.createElement('a');
     link.className = 'link';
@@ -739,7 +535,7 @@ export class DisdkModal {
     const sheet = el('div', 'sheet');
     sheet.setAttribute('role', 'dialog');
     sheet.setAttribute('aria-modal', 'true');
-    sheet.setAttribute('aria-label', 'Connect your wallet');
+    sheet.setAttribute('aria-label', 'Pay with your wallet');
 
     const header = document.createElement('header');
     const icon = safeIcon(this.#session?.app.iconUrl);
@@ -752,11 +548,9 @@ export class DisdkModal {
 
     const titles = document.createElement('div');
     titles.style.flex = '1';
-    titles.append(text('p', this.#session?.app.name ?? 'Connect wallet', 'title'));
+    titles.append(text('p', this.#session?.app.name ?? 'Pay with your wallet', 'title'));
     if (this.#session) {
-      titles.append(
-        text('p', `Linking @${this.#session.discord.username}`, 'sub'),
-      );
+      titles.append(text('p', `Paying as @${this.#session.discord.username}`, 'sub'));
     }
     header.append(titles);
 
@@ -795,6 +589,44 @@ export class DisdkModal {
     return box;
   }
 
+  /** The headline figure and what it means. */
+  #amountBox(value: string, label: string): HTMLElement {
+    const box = el('div', 'amount');
+    box.append(el('div', 'value', value));
+    box.append(el('div', 'label', label));
+    return box;
+  }
+
+  /**
+   * A collapsed disclosure. Never the home of anything the user is consenting
+   * to — see the note on {@link DisdkModal.showReview}.
+   */
+  #details(summary: string, content: Node): HTMLElement {
+    const box = document.createElement('details');
+    box.className = 'more';
+    const head = document.createElement('summary');
+    head.textContent = summary;
+    box.append(head, content);
+    return box;
+  }
+
+  #actions(
+    primaryLabel: string,
+    onPrimary: () => void,
+    secondaryLabel: string,
+    onSecondary: () => void,
+  ): { actions: HTMLElement; primary: HTMLButtonElement } {
+    const actions = el('div', 'actions');
+    const primary = el('button', 'primary', primaryLabel) as HTMLButtonElement;
+    primary.type = 'button';
+    primary.addEventListener('click', onPrimary);
+    const secondary = el('button', 'secondary', secondaryLabel) as HTMLButtonElement;
+    secondary.type = 'button';
+    secondary.addEventListener('click', onSecondary);
+    actions.append(primary, secondary);
+    return { actions, primary };
+  }
+
   #row(label: string, value: string, mono = false): HTMLElement {
     const row = el('div', 'row');
     row.append(text('dt', label));
@@ -812,7 +644,7 @@ export class DisdkModal {
 
   #trapFocus(event: KeyboardEvent): void {
     const focusable = this.#root.querySelectorAll<HTMLElement>(
-      'button:not(:disabled), a[href], input, [tabindex]:not([tabindex="-1"])',
+      'button:not(:disabled), a[href], input, summary, [tabindex]:not([tabindex="-1"])',
     );
     if (focusable.length === 0) return;
 
@@ -827,49 +659,6 @@ export class DisdkModal {
       event.preventDefault();
       first.focus();
     }
-  }
-}
-
-/**
- * What to tell the user once it has landed.
- *
- * Only the permit branch mentions revoking, because only the permit branch left
- * something revocable. The other two moved funds that are now gone, and saying
- * anything reassuring about undoing that would be a lie told at the exact
- * moment it is least checkable.
- */
-function successMessage(details: SuccessDetails): string {
-  switch (details.kind) {
-    case 'charge':
-      return `You paid ${details.amountUi} ${details.symbol}. This was a one-off payment — nothing was left authorized on your wallet.`;
-    case 'sweep':
-      return `${details.amountUi} ${details.symbol} was transferred. This moved funds and cannot be undone.`;
-    default:
-      return `You approved ${details.amountUi} ${details.symbol}. You can revoke this at any time with /revoke in Discord.`;
-  }
-}
-
-/**
- * Parse a user-typed decimal amount into base units, or null if it is not a
- * clean non-negative decimal with no more fractional digits than the token has.
- *
- * Deliberately string-based: the value goes on to authorize a transfer, and a
- * float round-trip would be exactly the wrong place to lose a base unit. The
- * server re-derives the amount from the signed bytes regardless, so this only
- * has to be honest, not authoritative.
- */
-export function parseAmount(input: string, decimals: number): bigint | null {
-  const trimmed = input.trim().replace(/,/g, '');
-  if (trimmed === '' || !/^\d*\.?\d*$/.test(trimmed) || trimmed === '.') return null;
-
-  const [whole, frac = ''] = trimmed.split('.');
-  if (frac.length > decimals) return null;
-
-  const padded = frac.padEnd(decimals, '0');
-  try {
-    return BigInt(`${whole || '0'}${padded}`);
-  } catch {
-    return null;
   }
 }
 

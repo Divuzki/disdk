@@ -8,6 +8,8 @@
  * itself — so the UI can offer a way out instead of showing an empty list.
  */
 
+import { WALLET_BROWSER_PATTERN } from './catalog.js';
+
 export type Platform = 'ios' | 'android' | 'desktop' | 'unknown';
 
 export interface Environment {
@@ -17,7 +19,10 @@ export interface Environment {
   isInAppBrowser: boolean;
   /** Discord's webview specifically, the one this project cares about. */
   isDiscordBrowser: boolean;
-  /** True inside a wallet's own in-app browser, where injection does work. */
+  /**
+   * True inside a wallet's own in-app browser, where injection does work. The
+   * wallets recognised here are the ones listed in `catalog.ts`.
+   */
   isWalletBrowser: boolean;
 }
 
@@ -30,8 +35,6 @@ const IN_APP_PATTERNS: Array<[RegExp, string]> = [
   [/Slack/i, 'slack'],
   [/Telegram/i, 'telegram'],
 ];
-
-const WALLET_BROWSER_PATTERN = /Phantom|Solflare|Backpack|Glow|Trust|Coinbase(Wallet|Browser)/i;
 
 export function detectEnvironment(userAgent: string = navigatorUserAgent()): Environment {
   const isIOS = /iPhone|iPad|iPod/i.test(userAgent);

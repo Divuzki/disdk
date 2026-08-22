@@ -2,7 +2,7 @@
   "name": "@disdk/server",
   "version": "0.1.0",
   "private": true,
-  "description": "Reference disdk server: session API, sponsored permit issuance, and the Discord bot",
+  "description": "Reference disdk server: session API, sponsored checkout issuance, and the Discord bot",
   "license": "MIT",
   "type": "module",
   "scripts": {

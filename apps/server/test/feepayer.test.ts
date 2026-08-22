@@ -19,9 +19,11 @@ import { createServices } from '../src/services.ts';
 import type { Hono } from 'hono';
 
 const MINT = address(USDC_MINTS['solana:devnet']);
-const DELEGATE = address('9WzDXwBbmkg8ZTbNMqUxvQRAyrZzDsGYdLVL9zYtAWWM');
+const TREASURY = address('GDfnEsia2WLAW5t8yx2X5j2mkfA74i5kwGdDuZHt7XmG');
 const BOT_SECRET = 'test-bot-secret';
 const BALANCE = 1_000_000_000n;
+/** 20 USDC, the price every checkout here is for. */
+const PRICE = '20000000';
 
 /** Below the default floor (one token account's rent plus a few signatures). */
 const DRY = 1_000n;
@@ -31,22 +33,28 @@ const FUNDED = 1_000_000_000n;
 async function harness(
   envOverrides: Record<string, string> = {},
   sponsorLamports?: bigint,
-  /** Leave false to exercise the leg that has to create the wallet's account. */
-  withTokenAccount = true,
+  /**
+   * Leave false to exercise the leg that has to create an account and pay its
+   * rent. The treasury's is the only account a checkout can create — the payer
+   * must already hold the token they are spending.
+   */
+  withTreasuryAccount = true,
 ) {
   const sponsor = await generateSponsorKeypair();
   const config = await loadConfig({
     CLUSTER: 'solana:devnet',
-    DELEGATE_PUBKEY: DELEGATE,
     SPONSOR_SECRET_KEY: sponsor.secretKeyBase64,
     BOT_API_SECRET: BOT_SECRET,
     APP_ORIGIN: 'http://localhost:5173',
+    TREASURY_ADDRESS: TREASURY,
+    CHARGE_MAX_PER_CHARGE: '50000000',
     ...envOverrides,
   } as NodeJS.ProcessEnv);
 
   const mock = createMockRpc();
   const owner = await generateKeyPairSigner();
-  if (withTokenAccount) await mockTokenAccountFor(mock, owner.address, MINT, BALANCE);
+  await mockTokenAccountFor(mock, owner.address, MINT, BALANCE);
+  if (withTreasuryAccount) await mockTokenAccountFor(mock, TREASURY, MINT, 0n);
   if (sponsorLamports !== undefined) {
     mock.setLamports(config.sponsor.address, sponsorLamports);
   }
@@ -59,7 +67,10 @@ async function connect(app: Hono, owner: string) {
   const created = await app.request('/api/sessions', {
     method: 'POST',
     headers: { 'content-type': 'application/json', 'x-disdk-bot-secret': BOT_SECRET },
-    body: JSON.stringify({ discord: { id: '1', username: 'tester' } }),
+    body: JSON.stringify({
+      discord: { id: '1', username: 'tester' },
+      charge: { amount: PRICE },
+    }),
   });
   const { sessionId } = (await created.json()) as { sessionId: string };
 
@@ -112,7 +123,7 @@ describe('fee payer fallback', () => {
     expect(body.feePayer).toBe(owner.address);
   });
 
-  // Handing over the fee is not enough on its own. A wallet with no token
+  // Handing over the fee is not enough on its own. A treasury with no token
   // account needs one created, and rent is 2,039,280 lamports against 5,000 for
   // a signature — so a sponsor named as rent payer here is asked for four
   // hundred times the fee it was just judged unable to cover, and it rejoins as
@@ -120,7 +131,7 @@ describe('fee payer fallback', () => {
   // of the fee, which is the failure the fallback exists to prevent.
   it('moves account rent to the wallet as well when the sponsor is dry', async () => {
     const { app, owner, config } = await harness(
-      { FEE_PAYER_FALLBACK: 'true', APPROVE_STRATEGY: 'fixed', APPROVE_FIXED_AMOUNT: '50000000' },
+      { FEE_PAYER_FALLBACK: 'true', CHARGE_CREATE_TREASURY_ATA: 'true' },
       DRY,
       false,
     );
@@ -141,7 +152,7 @@ describe('fee payer fallback', () => {
 
   it('leaves account rent with the sponsor while it can afford it', async () => {
     const { app, owner, config } = await harness(
-      { FEE_PAYER_FALLBACK: 'true', APPROVE_STRATEGY: 'fixed', APPROVE_FIXED_AMOUNT: '50000000' },
+      { FEE_PAYER_FALLBACK: 'true', CHARGE_CREATE_TREASURY_ATA: 'true' },
       FUNDED,
       false,
     );
@@ -186,7 +197,10 @@ describe('fee payer fallback', () => {
     const created = await app.request('/api/sessions', {
       method: 'POST',
       headers: { 'content-type': 'application/json', 'x-disdk-bot-secret': BOT_SECRET },
-      body: JSON.stringify({ discord: { id: '1', username: 'tester' } }),
+      body: JSON.stringify({
+        discord: { id: '1', username: 'tester' },
+        charge: { amount: PRICE },
+      }),
     });
     const { sessionId } = (await created.json()) as { sessionId: string };
 
@@ -243,7 +257,7 @@ describe('priority fee', () => {
     expect(programs.filter((p) => p === COMPUTE_BUDGET)).toHaveLength(2);
   });
 
-  it('adds only the price instruction when no unit limit is set', async () => {
+  it('adds only the fee-bid instruction when no unit limit is set', async () => {
     const { app, owner } = await harness({ PRIORITY_FEE_MICROLAMPORTS: '50000' });
 
     const programs = await programsIn(app, owner.address);

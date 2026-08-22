@@ -1,9 +1,4 @@
-import type {
-  CompleteResponse,
-  DisdkError,
-  SessionPublic,
-  SweepOfferPublic,
-} from '@disdk/protocol';
+import type { CompleteResponse, DisdkError, SessionPublic } from '@disdk/protocol';
 import type { DiscoveredWallet } from './wallets.js';
 
 export type DisdkState =
@@ -13,16 +8,8 @@ export type DisdkState =
   | 'connecting'
   | 'connected'
   | 'reviewing'
-  | 'permitting'
-  /**
-   * A sweep has been offered and the flow is waiting on the user to answer it.
-   *
-   * Its own state rather than a variant of `done`, because the difference
-   * matters to anyone watching: the permit has landed and nothing further will
-   * happen, but a question is on screen and the flow has not settled. Nothing
-   * moves out of here except a choice.
-   */
-  | 'offering'
+  /** The wallet has been handed the transfer and is waiting on the user. */
+  | 'paying'
   | 'done'
   | 'error';
 
@@ -31,17 +18,6 @@ export interface DisdkEventMap {
   session: SessionPublic;
   wallets: DiscoveredWallet[];
   connect: { publicKey: string; walletName: string };
-  /**
-   * A sweep is now available on this session, because the permit has been
-   * signed and has landed.
-   *
-   * An offer being announced, nothing more. A headless integration that ignores
-   * this event gets no sweep — the only thing that starts one is a call to
-   * {@link Disdk.authorizeSweep}, which exists to be wired to a deliberate
-   * choice in the integrator's own UI.
-   */
-  sweepOffer: SweepOfferPublic;
-  permit: CompleteResponse;
   done: CompleteResponse;
   error: DisdkError;
   disconnect: void;

@@ -18,15 +18,9 @@ export class DisdkApi {
     return this.#request('GET', `/api/sessions/${encodeURIComponent(sessionId)}`);
   }
 
-  connect(
-    sessionId: string,
-    publicKey: string,
-    /** Base units, for a user-priced charge only. The server bounds it. */
-    amount?: string,
-  ): Promise<ConnectResponse> {
+  connect(sessionId: string, publicKey: string): Promise<ConnectResponse> {
     return this.#request('POST', `/api/sessions/${encodeURIComponent(sessionId)}/connect`, {
       publicKey,
-      ...(amount ? { amount } : {}),
     });
   }
 

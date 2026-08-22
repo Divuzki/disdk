@@ -23,8 +23,8 @@ const BOUND = new WeakSet<Element>();
 
 const DEFAULT_LABELS: Partial<Record<DisdkState, string>> = {
   connecting: 'Connecting…',
-  reviewing: 'Review in wallet…',
-  permitting: 'Confirm in wallet…',
+  reviewing: 'Review the payment…',
+  paying: 'Confirm in wallet…',
 };
 
 export function autoAttach(options: AutoAttachOptions): { disdk: Disdk; stop(): void } {
@@ -58,7 +58,7 @@ export function autoAttach(options: AutoAttachOptions): { disdk: Disdk; stop(): 
       }
 
       if (element instanceof HTMLButtonElement) {
-        element.disabled = state === 'connecting' || state === 'permitting';
+        element.disabled = state === 'connecting' || state === 'paying';
       }
     });
 

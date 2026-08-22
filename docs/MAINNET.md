@@ -4,7 +4,7 @@ A step-by-step setup for running the real thing on your own machine: real USDC, 
 
 Everything here is checked against the code. Every environment variable named below is one `apps/server/src/config.ts` actually reads — nothing is aspirational.
 
-> **This spends real money.** The sponsor pays a real network fee for every transaction it builds. Depending on the flow you run, a user's approval can also grant a standing allowance over their real USDC. Read [What each flow actually does](#what-each-flow-actually-does) before you click anything.
+> **This spends real money.** The sponsor pays a real network fee for every transaction it builds, and every completed checkout moves a user's real USDC to your treasury immediately and irreversibly. What it never does is leave a standing claim on anyone's wallet — see [What the flow actually does](#what-the-flow-actually-does).
 
 ---
 
@@ -14,7 +14,7 @@ Everything here is checked against the code. Every environment variable named be
 |---|---|
 | Node 20+ and `pnpm` | `packageManager` is pinned to pnpm 10.33.0 |
 | A funded Solana account for the **sponsor** | It pays every network fee. Needs SOL, not USDC. |
-| A separate account for the **delegate** | Only its *public* key goes in the server env. See step 4. |
+| An account for the **treasury** | Where payments settle. Only its public key goes in the env. |
 | A dedicated mainnet RPC endpoint | The public one will rate-limit you. See step 3. |
 | A browser wallet (Phantom / Solflare / Backpack) | The thing you actually connect with |
 
@@ -44,15 +44,18 @@ cp apps/server/.env.example apps/server/.env
 
 If you edit `.env.example` and restart, nothing changes. Edit `.env`.
 
-### Three variables are mandatory
+### Four variables are mandatory
 
-The server refuses to boot without them (`required()` in `config.ts`):
+The server refuses to boot without them:
 
 | Variable | What it is |
 |---|---|
 | `SPONSOR_SECRET_KEY` | Base64 secret key of the fee payer. A hot key. |
-| `DELEGATE_PUBKEY` | **Public** key that receives allowances. Never the secret. |
 | `BOT_API_SECRET` | Shared secret for minting sessions. Any long random string. |
+| `TREASURY_ADDRESS` | **Public** key where payments settle. Never a secret. |
+| `CHARGE_MAX_PER_CHARGE` | Largest single charge, in base units. |
+
+The last one is mandatory for a reason worth stating: sessions are minted with `BOT_API_SECRET`, so without a ceiling a leaked secret could name any price and the user's own balance would be the only limit.
 
 ---
 
@@ -67,7 +70,7 @@ RPC_URL=https://your-endpoint.example.com
 
 **Do not ship on `api.mainnet-beta.solana.com`.** It is a public endpoint, aggressively rate-limited, and the first thing that will break under any real use. The code already turns a 429 into a clear retryable error (`withRpc` in `packages/verify/src/rpc.ts`), but that is damage control, not a fix. Get a dedicated endpoint from Helius, Triton, QuickNode, or Alchemy — any of them will do; what matters is that it is yours.
 
-The server makes these RPC calls per connect: `getLatestBlockhash`, `getAccountInfo` for the token account, plus `getBalance` if the fee-payer fallback is on, and `getTokenAccountsByOwner` on a sweep close leg. All at `confirmed` commitment.
+The server makes these RPC calls per connect: `getLatestBlockhash`, `getAccountInfo` for the payer's token account and the treasury's, plus `getBalance` if the fee-payer fallback is on. All at `confirmed` commitment.
 
 ### Priority fees — this is what "fast" means on mainnet
 
@@ -78,22 +81,19 @@ COMPUTE_UNIT_LIMIT=60000
 
 Both are unset by default, which means **no priority bid at all**. That is fine on devnet and a genuine liability on mainnet: under congestion a transaction with no bid can sit until its blockhash expires (~60–90 seconds) and the user just sees it fail.
 
-Set both together. The bid is *per compute unit*, so the limit matters — the default 200,000 CU reservation is far more than these transactions use, and leaving it unset pays for headroom you never touch. A permit or transfer fits comfortably in 60,000 CU. At 50,000 µlamports/CU that is roughly 0.000003 SOL of priority on top of the 5,000-lamport base fee.
+Set both together. The bid is *per compute unit*, so the limit matters — the default 200,000 CU reservation is far more than these transactions use, and leaving it unset pays for headroom you never touch. A transfer fits comfortably in 60,000 CU. At 50,000 µlamports/CU that is roughly 0.000003 SOL of priority on top of the 5,000-lamport base fee.
 
 Raise the bid when the network is busy. These are set once at boot, so a restart is how you change them.
 
 ---
 
-## 4. Decide who the delegate is — before you connect anything
+## 4. Keys: there is one hot key, and it can only pay fees
 
-`DELEGATE_PUBKEY` is the account that receives the standing allowance in a permit flow. **Whoever holds its secret key can move up to the approved amount of a connected user's USDC, at any time, until revoked.** SPL delegates have no on-chain expiry.
+The sponsor signs constantly and holds SOL. That is the only secret this server needs.
 
-Two rules that follow from that:
+`TREASURY_ADDRESS` is a **public** key. The server never spends from it — it only names it as a transfer destination — so use an account this server has no key for. That is the whole point: a full compromise of this process cannot move money out of the treasury, only into it.
 
-- It must be an account **you control**. If you paste in a key you found somewhere, you are handing that party a claim on every wallet that connects.
-- It must **not** be the same account as the sponsor. The sponsor is a hot key that signs constantly; the delegate is custody-grade. The server prints a warning if you set them to the same account, but it will not stop you.
-
-Only the delegate's *secret* key is needed by `apps/charge`, which is a separate process for exactly this reason. The session server never sees it.
+There is no delegate key anywhere in this system any more. The standing-allowance flow that needed one has been removed, so there is no custody-grade secret to protect, no `apps/charge` process, and nothing that can pull funds while a user is away.
 
 ### Importing your sponsor key
 
@@ -114,59 +114,33 @@ It reads the secret from **stdin**, never argv, so it stays out of shell history
 | Priority fee (at the settings above) | ~3,000 |
 | **Creating one token account** | **2,039,280** |
 
-The third row is the one that matters. Rent is roughly 400× a fee, and it is the reason sponsors run dry. A sponsor holding 0.1 SOL covers thousands of ordinary approvals but only ~49 token-account creations.
+The third row is the one that matters. Rent is roughly 400× a fee, and it is the reason sponsors run dry. A sponsor holding 0.1 SOL covers thousands of ordinary payments but only ~49 token-account creations — and it only creates one at all if you set `CHARGE_CREATE_TREASURY_ATA=true`.
 
 ---
 
-## 5. Choose your flow
-
-Set the rest of `.env` according to what you actually want. **All three of these are off by default** and stay off unless you configure them.
-
-### Permit — the default
+## 5. Configure the checkout
 
 ```bash
-APPROVE_STRATEGY=percentOfBalance
-APPROVE_PERCENT=0.8
-# APPROVE_MAX_AMOUNT=          # optional hard ceiling, base units
-```
-
-Connecting and approving grants a standing allowance. **No USDC moves.** `APPROVE_STRATEGY` accepts `percentOfBalance`, `fixed` (with `APPROVE_FIXED_AMOUNT`), or `unlimited`.
-
-`unlimited` approves `u64::MAX` — it covers future deposits, never goes stale, and produces the worst wallet warning. Use it only deliberately.
-
-### Checkout — user-signed one-off payment
-
-```bash
-TREASURY_ADDRESS=<where charges settle>
-CHARGE_MAX_PER_CHARGE=50000000          # mandatory once treasury is set
+TREASURY_ADDRESS=<where payments settle>
+CHARGE_MAX_PER_CHARGE=50000000          # mandatory
 CHARGE_MAX_PER_PERIOD=200000000
 CHARGE_MAX_PER_PERIOD_COUNT=10
 CHARGE_PERIOD_MS=86400000
 CHARGE_MIN_INTERVAL_MS=5000
+CHARGE_CREATE_TREASURY_ATA=false
 ```
 
-The per-charge ceiling is mandatory and the server refuses to boot without it, because sessions are minted with `BOT_API_SECRET` — a leaked secret could otherwise name any price and the user's own balance would be the only limit.
+The rolling-window limits are all per wallet. They are a product guarantee rather than a security boundary: this server enforces them, so they bound a buggy or compromised merchant integration, not somebody holding the sponsor key.
 
-If you only need to be paid once, this is strictly the smaller ask than a permit. Nothing is left behind to revoke.
+They are recorded **after** a charge lands, not when the link is built, so a checkout the user walked away from does not consume budget they never spent.
 
-### Sweep — offered after signing, moves funds now
+### Two kinds of checkout
 
-```bash
-COLD_WALLET_PUBKEY=<fixed destination>   # empty = feature does not exist
-SWEEP_STRATEGY=percentOfBalance
-SWEEP_PERCENT=0.8
-SWEEP_MAX_AMOUNT=1000000000000           # 1,000,000 USDC ceiling
-SWEEP_RENT_DESTINATION=cold
-SWEEP_CLOSE_MAX_ACCOUNTS=15
-```
+`charge.amount` present on `POST /api/sessions` is **merchant-priced**: the price is settled before the link exists, and the browser cannot alter it. The server ignores any amount a later request supplies.
 
-Leaving `COLD_WALLET_PUBKEY` empty disables it entirely, which is the default.
+`charge.amount` omitted is a **balance share**: the amount is `CHARGE_PERCENT_OF_BALANCE` of what the payer holds when they connect — 80% by default — resolved server-side from the balance and capped at `CHARGE_SHARE_MAX_AMOUNT` (1,000,000 USDC by default), at `CHARGE_MAX_PER_CHARGE`, and at the room left in the rolling window. No figure is taken from the browser on either kind. Both `/connect` and the anonymous endpoint mint this kind, because nobody has authenticated the caller in either case.
 
-Setting it makes the sweep **offerable to every user, immediately after their allowance lands** — and offerable is all it makes it. The page then asks them, showing the policy, the destination in full, and that it is irreversible. Their answer is the authorization: the browser posts `{"consent": true}` to `POST /api/sessions/:id/sweep/authorize`, and the server records it before it will build a single sweep transaction. Declining, closing the page, or never answering all leave the wallet untouched.
-
-What that means for you on mainnet: **there is no configuration here that moves anyone's funds.** `POST /api/sessions` refuses `intent: "sweep"` outright even with a valid `BOT_API_SECRET`, `/connect` refuses to issue a sweep leg for a session with no recorded consent, and the consent is pinned to the wallet that signed the permit. A leaked bot secret cannot sweep anybody.
-
-`SWEEP_MAX_AMOUNT` is a hard ceiling on top of whatever the strategy computes, and it is named in the question the user is asked.
+On mainnet the share is the setting to look at hardest before you open the doors: it is the one number that decides how much a stranger's payment is, and it is not a number they chose. Set `CHARGE_MAX_PER_CHARGE` to what a single payment should really be worth to you — it caps the share as well — and lower `CHARGE_SHARE_MAX_AMOUNT` if 1,000,000 USDC is not a sum you ever intend to take in one transfer.
 
 ### Fee-payer fallback
 
@@ -175,7 +149,7 @@ FEE_PAYER_FALLBACK=false
 # SPONSOR_MIN_LAMPORTS=
 ```
 
-Off by default. On, a sponsor that has dropped below the floor hands the fee to the connecting wallet instead of failing. It applies to **every** flow including ordinary `/connect`, so leave it off if "you need no SOL" is a promise you are making to your users. When it engages, the review screen says the user is paying before they sign.
+Off by default. On, a sponsor that has dropped below the floor hands the fee to the connecting wallet instead of failing. Leave it off if "you need no SOL" is a promise you are making to your users. When it engages, the review screen says the user is paying — and moves the fee and rent lines back into the primary summary, because they are now the user's money.
 
 ---
 
@@ -190,7 +164,7 @@ DISCORD_ROLE_ID=
 
 Leave all of these blank and the bot stays disabled — you will see `[disdk] DISCORD_TOKEN/DISCORD_CLIENT_ID not set — bot disabled.` on boot. The HTTP API works fully without it.
 
-**`/sweep` and `/revoke` are bot commands.** With the bot off, you can still reach both over the API (see step 9), but there is no one-click revoke. Decide that before you approve anything.
+There is exactly one command, `/connect`, and it mints a balance-share checkout link. Nothing about the flow requires Discord; the bot is a convenient way to hand somebody a link.
 
 To run the demo without Discord at all:
 
@@ -198,7 +172,7 @@ To run the demo without Discord at all:
 ALLOW_ANONYMOUS_SESSIONS=true
 ```
 
-The connect page then mints its own session. It proves nothing about who is asking, which is why it is opt-in.
+The connect page then mints its own session. It proves nothing about who is asking, which is why it is opt-in — and why it is always a balance share.
 
 ---
 
@@ -214,11 +188,11 @@ Two processes: the API on `:8787` and the demo on `:5173`. Boot output tells you
 [disdk] api listening on http://localhost:8787
 [disdk] cluster solana:mainnet, mint EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v
 [disdk] sponsor (fee payer) <address>
-[disdk] delegate (spender)  <address>
-[disdk] allowance policy: 80% of your USDC balance
+[disdk] treasury (settles to) <address>
+[disdk] terms: up to 50.00 USDC per charge…
 ```
 
-If the cluster line does not say what you expect, stop.
+If the cluster line does not say what you expect, stop. If the treasury line is not the account you meant, stop.
 
 Open **http://localhost:5173**.
 
@@ -230,48 +204,26 @@ Open **http://localhost:5173**.
 curl -s localhost:8787/health
 # {"ok":true,"cluster":"solana:mainnet"}
 
-# Mint a session and read back the exact policy the browser will be shown
+# Mint a session and read back the exact terms the browser will be shown
 curl -s -X POST localhost:8787/api/sessions \
   -H "x-disdk-bot-secret: $BOT_API_SECRET" \
   -H 'content-type: application/json' \
-  -d '{"discord":{"id":"1","username":"you"}}'
+  -d '{"discord":{"id":"1","username":"you"},"charge":{"amount":"1000000"}}'
 ```
 
-Open the returned `url`. The page shows the live policy read from the server before you connect anything — the delegate, the amount, and who pays the fee. Check the delegate address against the one you meant.
+Open the returned `url`. The page shows the live terms read from the server before you connect anything — the treasury, the amount, and who pays the fee. Check the treasury address against the one you meant.
+
+Then check what the wallet itself shows. A correct checkout produces **no approval warning and no "up to" line** in Phantom, because the transaction carries a `TransferChecked` and nothing else. If you ever see a wallet warn about future withdrawals on this flow, stop and read the bytes — something is building an `ApproveChecked` that should not exist.
 
 ---
 
-## 9. Revoking
-
-Revoke is a session intent, so it works with or without the bot:
-
-```bash
-curl -X POST localhost:8787/api/sessions \
-  -H "x-disdk-bot-secret: $BOT_API_SECRET" \
-  -H 'content-type: application/json' \
-  -d '{"discord":{"id":"1","username":"you"},"intent":"revoke"}'
-```
-
-Open the link and sign. Have this ready **before** you approve an allowance, not after.
-
-To see what a wallet has currently granted:
-
-```bash
-curl "localhost:8787/api/permits/<wallet>?session=<sessionId>"
-```
-
----
-
-## What each flow actually does
+## What the flow actually does
 
 | | Who signs | When | What is left behind |
 |---|---|---|---|
-| **Permit** | The user | Once, up front | A standing allowance, until revoked |
-| **Charge** (pull) | Your delegate key | Later, user absent | The allowance, minus what you pulled |
 | **Checkout** | The user | At the moment they pay | Nothing |
-| **Sweep** | The user (an operator) | Once, deliberately | Nothing |
 
-A permit moves no money by itself. A checkout and a sweep move money immediately and there is nothing to revoke afterwards.
+That is the entire table now. The user signs one transfer, for one amount, once. Nothing outlives it, which is why there is nothing to revoke afterwards and no `/revoke` command to run.
 
 ---
 
@@ -282,7 +234,7 @@ A permit moves no money by itself. A checkout and a sweep move money immediately
 - **The session store is in memory.** Every session and every charge-limit ledger entry resets on restart. `CHARGE_MAX_PER_PERIOD` is not enforced across a restart. Point it at a database.
 - **Serve the demo built**, not from Vite: `pnpm --filter @disdk/demo build`.
 - **Real origin over HTTPS.** Set `APP_ORIGIN` and `CORS_ORIGINS` to it. Wallets warn harder on origins they do not recognise, and a cold domain gets warned about regardless.
-- **Split the keys.** Sponsor is hot, delegate is custody. `apps/charge` is a separate process precisely so the session server never holds the delegate secret.
+- **Keep the treasury unspendable from here.** The server only ever names it as a destination; do not give this process a key for it.
 - **Rate limits** are in-process only, so they reset on restart and do not coordinate across instances.
 
 ---
@@ -295,8 +247,7 @@ A permit moves no money by itself. A checkout and a sweep move money immediately
 | Stale behaviour after editing a package | Run `pnpm build` — apps resolve `dist/`. |
 | `429` / rate limit errors | Public RPC. Get a dedicated endpoint. |
 | Transaction never lands | No priority fee. Set `PRIORITY_FEE_MICROLAMPORTS`. |
-| `INSUFFICIENT_BALANCE` on a wallet holding USDC | Its token account may not exist yet, or the sweep amount exceeds the balance. |
+| `INSUFFICIENT_BALANCE` on a wallet holding USDC | Its token account may not exist yet, or the price exceeds the balance. |
+| `The treasury … has no USDC token account` | Create it, or set `CHARGE_CREATE_TREASURY_ATA=true` to have the sponsor pay its rent. |
 | Server refuses to boot | Read the message — every config error is thrown eagerly at boot with the variable named. |
-| No sweep offer after connecting | `COLD_WALLET_PUBKEY` unset. There is no sweep command — it is offered on the page once the allowance lands. |
-| Sweep refused with `UNAUTHORIZED` | The session carries no recorded consent, or a different wallet connected than the one that approved. |
-| Wallet shows a scam warning on approval | Expected for a large delegation from an unrecognised origin. |
+| `intent must be charge` | An old integration is still sending `intent: "permit"`. There is one flow now. |

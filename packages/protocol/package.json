@@ -1,7 +1,7 @@
 {
   "name": "@disdk/protocol",
   "version": "0.1.0",
-  "description": "Shared wire types and validators for the disdk Discord to Solana permit flow",
+  "description": "Shared wire types and validators for the disdk sponsored USDC checkout",
   "license": "MIT",
   "type": "module",
   "main": "./dist/index.js",

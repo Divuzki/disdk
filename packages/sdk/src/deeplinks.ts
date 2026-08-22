@@ -7,9 +7,13 @@
  * the URL, so the flow resumes exactly where it left off — which is why the
  * session must stay valid across reopens rather than being consumed on first
  * view.
+ *
+ * Which wallets publish such a link, and where that link actually lands, lives
+ * in `catalog.ts`; this module only decides when to offer them.
  */
 
-import type { Environment } from './environment.js';
+import type { Environment, Platform } from './environment.js';
+import { browsableWallets } from './catalog.js';
 
 export interface WalletDeeplink {
   id: string;
@@ -17,21 +21,14 @@ export interface WalletDeeplink {
   url: string;
 }
 
-/**
- * Phantom: `https://phantom.app/ul/browse/<url>?ref=<ref>`, both components
- * URL-encoded.
- */
-export function phantomBrowseLink(target: string, ref: string): string {
-  return `https://phantom.app/ul/browse/${encodeURIComponent(target)}?ref=${encodeURIComponent(ref)}`;
-}
-
-export function solflareBrowseLink(target: string, ref: string): string {
-  return `https://solflare.com/ul/v1/browse/${encodeURIComponent(target)}?ref=${encodeURIComponent(ref)}`;
-}
-
-export function backpackBrowseLink(target: string, ref: string): string {
-  return `https://backpack.app/ul/v1/browse/${encodeURIComponent(target)}?ref=${encodeURIComponent(ref)}`;
-}
+export {
+  phantomBrowseLink,
+  solflareBrowseLink,
+  backpackBrowseLink,
+  trustBrowseLink,
+  coinbaseBrowseLink,
+  okxBrowseLink,
+} from './catalog.js';
 
 /**
  * Android intent URL that reopens the page in Chrome, escaping the host app's
@@ -42,12 +39,19 @@ export function chromeIntentLink(target: string): string {
   return `intent://${withoutScheme}#Intent;scheme=https;package=com.android.chrome;end`;
 }
 
-export function buildDeeplinks(target: string, ref: string): WalletDeeplink[] {
-  return [
-    { id: 'phantom', name: 'Phantom', url: phantomBrowseLink(target, ref) },
-    { id: 'solflare', name: 'Solflare', url: solflareBrowseLink(target, ref) },
-    { id: 'backpack', name: 'Backpack', url: backpackBrowseLink(target, ref) },
-  ];
+/**
+ * Every wallet that can take this page off our hands, minus the ones whose
+ * browser does not exist on `platform`. Passing no platform keeps all of them,
+ * which is what a caller outside the modal usually wants.
+ */
+export function buildDeeplinks(target: string, ref: string, platform?: Platform): WalletDeeplink[] {
+  return browsableWallets(platform).map(({ id, name, browse }) => ({
+    id,
+    name,
+    // `browsableWallets` selects on `browse` being present; the assertion is
+    // narrowing, not a claim.
+    url: browse!(target, ref),
+  }));
 }
 
 export interface EscapeOptions {
@@ -74,13 +78,15 @@ export function planEscape({ environment, href, origin }: EscapeOptions): Escape
     return { needed: false, wallets: [] };
   }
 
+  const wallets = () => buildDeeplinks(href, origin, environment.platform);
+
   if (!environment.isInAppBrowser) {
     // A normal browser with no wallet is an install problem, not a routing one —
     // except on mobile, where deeplinking into a wallet app is still the fix.
-    return { needed: environment.isMobile, wallets: environment.isMobile ? buildDeeplinks(href, origin) : [] };
+    return { needed: environment.isMobile, wallets: environment.isMobile ? wallets() : [] };
   }
 
-  const route: EscapeRoute = { needed: true, wallets: buildDeeplinks(href, origin) };
+  const route: EscapeRoute = { needed: true, wallets: wallets() };
   if (environment.platform === 'android') {
     route.chromeIntent = chromeIntentLink(href);
   }

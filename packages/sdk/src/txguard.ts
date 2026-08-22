@@ -284,11 +284,10 @@ const ALLOWED_PROGRAMS = new Set([
 /**
  * Decode a transaction into the operations it actually performs.
  *
- * This function *reports*; it does not judge. It deliberately does not decide
- * whether a transfer or a close is acceptable, because that answer differs by
- * flow: a transfer is the whole point of a sweep and an attack in a permit. Each
- * `verify*` function applies its own allowlist to this result, so adding a new
- * flow can never silently widen what an existing one tolerates.
+ * This function *reports*; it does not judge. It still decodes approvals,
+ * revokes and closes even though nothing here builds them — that is the point.
+ * A guard that only looked for what it expected to find could not refuse what it
+ * did not. {@link verifyChargeTransaction} applies the judgement.
  *
  * The only things it still throws on are instructions it cannot parse at all,
  * where reporting a half-decoded operation would be worse than refusing.
@@ -457,189 +456,13 @@ function assertCommonSafety(
   }
 }
 
-export interface PermitExpectation {
-  feePayer: string;
-  owner: string;
-  mint: string;
-  delegate: string;
-  /** Base-unit amount the server said it encoded. */
-  amount: bigint;
-  decimals: number;
-}
-
-export interface VerifiedPermit {
-  /** The amount read out of the transaction bytes — this is what the UI shows. */
-  amount: bigint;
-  delegate: string;
-  mint: string;
-  owner: string;
-  createsAccount: boolean;
-}
-
 /**
- * Refuse to sign anything that is not exactly the approval we were promised.
+ * The core question, asked of the decoded bytes rather than of the server:
+ * "is this exactly one checked transfer, of this token, for this amount, from
+ * this wallet, to this account?"
  *
- * Every check here is about what the *user* is agreeing to. The server cannot
- * widen the allowance, redirect it to another delegate, swap the token, or
- * smuggle in a transfer without this failing first.
- */
-export function verifyPermitTransaction(
-  transactionBase64: string,
-  expected: PermitExpectation,
-): VerifiedPermit {
-  const inspection = inspectTransaction(transactionBase64);
-  const { approve } = inspection;
-
-  assertCommonSafety(inspection, expected.feePayer);
-
-  // `inspectTransaction` used to throw on these directly. Now that it collects
-  // them so the sweep flow can read them, a permit has to refuse them here — an
-  // allowance grant must never also move funds or close an account.
-  if (inspection.transfers.length > 0) {
-    throw new DisdkError(
-      'UNSAFE_TRANSACTION',
-      'This transaction would move tokens, which an approval must never do.',
-    );
-  }
-
-  if (inspection.closes.length > 0) {
-    throw new DisdkError(
-      'UNSAFE_TRANSACTION',
-      'This transaction would close a token account, which an approval must never do.',
-    );
-  }
-
-  if (!approve) {
-    throw new DisdkError('UNSAFE_TRANSACTION', 'This transaction contains no approval.');
-  }
-
-  if (approve.unchecked) {
-    throw new DisdkError(
-      'UNSAFE_TRANSACTION',
-      'This transaction uses an unchecked approval, which cannot confirm the token.',
-    );
-  }
-
-  if (approve.mint !== expected.mint) {
-    throw new DisdkError('UNSAFE_TRANSACTION', 'This approval is for a different token.');
-  }
-
-  if (approve.delegate !== expected.delegate) {
-    throw new DisdkError('UNSAFE_TRANSACTION', 'This approval names an unexpected delegate.');
-  }
-
-  if (approve.owner !== expected.owner) {
-    throw new DisdkError('UNSAFE_TRANSACTION', 'This approval is for a different wallet.');
-  }
-
-  if (approve.decimals !== expected.decimals) {
-    throw new DisdkError('UNSAFE_TRANSACTION', 'This approval declares unexpected token decimals.');
-  }
-
-  if (approve.amount !== expected.amount) {
-    throw new DisdkError(
-      'UNSAFE_TRANSACTION',
-      'The amount in this transaction does not match the amount you were shown.',
-    );
-  }
-
-  return {
-    amount: approve.amount,
-    delegate: approve.delegate,
-    mint: approve.mint,
-    owner: approve.owner,
-    createsAccount: inspection.createsAccount,
-  };
-}
-
-// ---------------------------------------------------------------------------
-// Sweep
-// ---------------------------------------------------------------------------
-
-export interface SweepTransferExpectation {
-  feePayer: string;
-  owner: string;
-  mint: string;
-  /** Destination *token account*, not the cold wallet's own address. */
-  destination: string;
-  amount: bigint;
-  decimals: number;
-}
-
-export interface SweepCloseExpectation {
-  feePayer: string;
-  owner: string;
-  /** Where reclaimed rent must go. */
-  rentTo: string;
-  /** Token accounts the server said it would close. */
-  accounts: readonly string[];
-  /** Upper bound on close instructions, from server config. */
-  maxAccounts: number;
-}
-
-export interface VerifiedSweepTransfer {
-  /** Read out of the bytes — this is what the UI shows. */
-  amount: bigint;
-  mint: string;
-  destination: string;
-  owner: string;
-  createsAccount: boolean;
-}
-
-export interface VerifiedSweepClose {
-  accounts: string[];
-  rentTo: string;
-}
-
-/**
- * Refuse to sign anything that is not exactly the transfer we were promised.
- *
- * A sweep moves funds irreversibly, so this is stricter than the permit guard in
- * the one way that matters most: `assertNoApproval` refuses any approval
- * instruction outright. Hiding a fresh delegate allowance inside a transaction
- * the user has already decided to accept is the classic drainer move — the
- * transfer they reviewed completes, and the allowance they never saw quietly
- * outlives it.
- */
-export function verifySweepTransfer(
-  transactionBase64: string,
-  expected: SweepTransferExpectation,
-): VerifiedSweepTransfer {
-  const inspection = inspectTransaction(transactionBase64);
-
-  assertCommonSafety(inspection, expected.feePayer);
-  assertNoApproval(inspection);
-
-  if (inspection.closes.length > 0) {
-    throw new DisdkError(
-      'UNSAFE_TRANSACTION',
-      'This transfer would also close an account. Those are signed separately.',
-    );
-  }
-
-  const transfer = verifyExactTransfer(inspection, expected);
-
-  return {
-    amount: transfer.amount,
-    mint: transfer.mint,
-    destination: transfer.destination,
-    owner: transfer.owner,
-    createsAccount: inspection.createsAccount,
-  };
-}
-
-/**
- * The single-transfer check shared by the sweep and charge guards.
- *
- * Both flows ask the identical question — "is this exactly one checked transfer,
- * of this token, for this amount, from this wallet, to this account?" — and the
- * answer must not be allowed to drift between them. Sharing it means a fix to
- * one is a fix to both, which for a decoder standing between a user and their
- * balance is worth more than two independently readable copies.
- *
- * What is deliberately *not* shared is everything around it: which additional
- * instructions each flow tolerates is exactly where they differ, so each caller
- * states that for itself.
+ * Kept separate from its caller so what the transfer must be stays legible
+ * apart from what else the transaction is allowed to contain.
  */
 function verifyExactTransfer(
   inspection: TransactionInspection,
@@ -721,15 +544,18 @@ export interface VerifiedCharge {
 /**
  * Refuse to sign anything that is not exactly the payment we were promised.
  *
- * Held to the sweep's standard rather than the permit's, because what is at
- * stake is the same: funds leave immediately and no revoke undoes it. In
- * particular an approval is refused outright — a checkout is the most natural
- * place in this whole project to slip a standing allowance past someone, since
- * the user has already decided to part with money and is looking for the
- * confirm button. The one thing they must not be able to agree to by accident
- * is the thing that outlives the purchase.
+ * This is the only guard left, and it is the strict one. Funds leave
+ * immediately and nothing undoes it, so an approval is refused outright: a
+ * checkout is the most natural place in this whole project to slip a standing
+ * allowance past someone, since the user has already decided to part with money
+ * and is looking for the confirm button. The one thing they must not be able to
+ * agree to by accident is the thing that would outlive the purchase.
+ *
+ * This server no longer builds approvals at all, which makes the check more
+ * important rather than less: it is now the thing that would notice if one ever
+ * reappeared.
  */
-export function verifyChargeTransfer(
+export function verifyChargeTransaction(
   transactionBase64: string,
   expected: ChargeExpectation,
 ): VerifiedCharge {
@@ -757,74 +583,7 @@ export function verifyChargeTransfer(
 }
 
 /**
- * Refuse to sign anything that is not exactly the set of closes we were
- * promised. Closing an account is not a fund transfer, but its rent destination
- * is, so that is checked as strictly as a transfer's destination.
- */
-export function verifySweepClose(
-  transactionBase64: string,
-  expected: SweepCloseExpectation,
-): VerifiedSweepClose {
-  const inspection = inspectTransaction(transactionBase64);
-
-  assertCommonSafety(inspection, expected.feePayer);
-  assertNoApproval(inspection);
-
-  if (inspection.transfers.length > 0) {
-    throw new DisdkError(
-      'UNSAFE_TRANSACTION',
-      'This transaction would move tokens as well as close accounts.',
-    );
-  }
-
-  if (inspection.closes.length === 0) {
-    throw new DisdkError('UNSAFE_TRANSACTION', 'This transaction closes no accounts.');
-  }
-
-  if (inspection.closes.length > expected.maxAccounts) {
-    throw new DisdkError(
-      'UNSAFE_TRANSACTION',
-      `This transaction closes more accounts than allowed (${inspection.closes.length} > ${expected.maxAccounts}).`,
-    );
-  }
-
-  const promised = new Set(expected.accounts);
-  if (inspection.closes.length !== promised.size) {
-    throw new DisdkError(
-      'UNSAFE_TRANSACTION',
-      'This transaction closes a different number of accounts than you were shown.',
-    );
-  }
-
-  for (const close of inspection.closes) {
-    if (!promised.has(close.account)) {
-      throw new DisdkError(
-        'UNSAFE_TRANSACTION',
-        'This transaction closes an account you were not shown.',
-      );
-    }
-    if (close.owner !== expected.owner) {
-      throw new DisdkError(
-        'UNSAFE_TRANSACTION',
-        'This transaction closes an account belonging to a different wallet.',
-      );
-    }
-    if (close.destination !== expected.rentTo) {
-      throw new DisdkError(
-        'UNSAFE_TRANSACTION',
-        'This transaction sends reclaimed rent to an unexpected account.',
-      );
-    }
-  }
-
-  return {
-    accounts: inspection.closes.map((close) => close.account),
-    rentTo: expected.rentTo,
-  };
-}
-
-/**
- * A transfer must never also change an allowance. Both approve variants are
+ * A payment must never also change an allowance. Both approve variants are
  * refused — the unchecked one cannot even name the token it is delegating — and
  * so is a revoke, since a flow that moves funds has no business quietly editing
  * a permission the user set up elsewhere.
@@ -839,7 +598,7 @@ function assertNoApproval(inspection: TransactionInspection): void {
   if (inspection.revokes > 0) {
     throw new DisdkError(
       'UNSAFE_TRANSACTION',
-      'This transaction changes an allowance, which a sweep must never do.',
+      'This transaction changes an allowance, which a payment must never do.',
     );
   }
 }

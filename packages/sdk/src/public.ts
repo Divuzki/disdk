@@ -23,7 +23,7 @@ export type { SignOutcome } from './signing.js';
 export {
   decodeTransaction,
   inspectTransaction,
-  verifyPermitTransaction,
+  verifyChargeTransaction,
   TOKEN_PROGRAM,
   TOKEN_2022_PROGRAM,
   ASSOCIATED_TOKEN_PROGRAM,
@@ -31,11 +31,10 @@ export {
   MEMO_PROGRAM,
 } from './txguard.js';
 export type {
-  ApproveDetails,
   DecodedTransaction,
-  PermitExpectation,
+  ChargeExpectation,
   TransactionInspection,
-  VerifiedPermit,
+  VerifiedCharge,
 } from './txguard.js';
 
 export { detectEnvironment, inAppBrowserName } from './environment.js';
@@ -47,9 +46,23 @@ export {
   phantomBrowseLink,
   solflareBrowseLink,
   backpackBrowseLink,
+  trustBrowseLink,
+  coinbaseBrowseLink,
+  okxBrowseLink,
   chromeIntentLink,
 } from './deeplinks.js';
 export type { EscapeRoute, WalletDeeplink } from './deeplinks.js';
+
+export {
+  WALLET_CATALOG,
+  WALLET_BROWSER_PATTERN,
+  browsableWallets,
+  installableWallets,
+  suggestableWallets,
+  isSameWallet,
+  findWallet,
+} from './catalog.js';
+export type { WalletConnectivity, WalletProfile } from './catalog.js';
 
 export { base58Encode, base58Decode, base64Encode, base64Decode } from './codec.js';
 
@@ -66,11 +79,9 @@ export {
   U64_MAX,
 } from '@disdk/protocol';
 export type {
-  AmountStrategy,
   Cluster,
   CompleteResponse,
   ConnectResponse,
   DisdkErrorCode,
-  PermitStatus,
   SessionPublic,
 } from '@disdk/protocol';
